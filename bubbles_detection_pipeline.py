@@ -23,7 +23,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 Hyperparameters
 """
 VIDEO_PATH = "./data/raw/x_ray_video.mp4"
-TEXT_PROMPT = "bubble."
+TEXT_PROMPT = "bubble.pore"
 OUTPUT_VIDEO_PATH = "./data/output/bubbles_groundedSAM.mp4"
 SOURCE_VIDEO_FRAME_DIR = "./data/frames/custom_video_frames"
 SAVE_TRACKING_RESULTS_DIR = "./data/output/tracking_results"
@@ -34,7 +34,7 @@ MAX_BOX_AREA_RATIO = 0.07  # filter out boxes larger than 5% of image area
 DETECT_INTERVAL = 1  # run detection every N frames (1 = every frame)
 
 # Temporal filtering parameters
-MIN_TRACK_LENGTH = 10       # minimum frames a track must span to be kept
+MIN_TRACK_LENGTH = 5       # minimum frames a track must span to be kept
 TRACK_IOU_THRESHOLD = 0.3  # min IoU to link detections across consecutive frames
 MAX_TRACK_GAP = 2          # max frames a track can go unmatched before ending
 

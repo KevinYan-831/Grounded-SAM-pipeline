@@ -90,6 +90,7 @@ Each surviving bubble gets a consistent `track_id` across all frames it appears 
 Grounded-SAM-pipeline/
 ├── bubbles_detection_pipeline.py   # Main pipeline (two-pass + temporal filtering)
 ├── evaluate.py                     # Evaluation against labelme ground truth
+├── tune_params.py                  # Automatic hyperparameter grid search
 ├── setup.py                        # SAM 2 package setup
 ├── pyproject.toml                  # Build system config
 ├── checkpoints/
@@ -103,6 +104,7 @@ Grounded-SAM-pipeline/
     ├── frames/custom_video_frames/ # Extracted & cropped frames
     ├── output/
     │   ├── detections.json         # Detection results with track IDs
+    │   ├── tuning_results.json    # Grid search results (from tune_params.py)
     │   ├── masks/                  # Raw mask .npy files per frame
     │   ├── tracking_results/       # Annotated frame images
     │   └── bubbles_groundedSAM.mp4 # Output video
@@ -258,35 +260,73 @@ python bubbles_detection_pipeline.py
 
 ---
 
-## Evaluation
+## Evaluation & Tuning
 
-Compare pipeline output against labelme ground truth annotations.
+### 1. Annotate ground truth
 
-### 1. Select random frames for annotation
+Select random frames from pipeline output and annotate with labelme:
 
 ```bash
 python evaluate.py --select-frames --num-frames 10
-```
-
-This copies random frames to `data/labelme/`. Then annotate with labelme:
-
-```bash
 labelme data/labelme/
 ```
 
 Label bubbles as polygons with the label `bubble`.
 
-### 2. Run evaluation
+### 2. Evaluate current parameters
 
 ```bash
 python evaluate.py --iou-threshold 0.5
 ```
 
-Reports pixel-level (precision, recall, F1, IoU) and instance-level (Hungarian matching) metrics per frame and averaged.
+Reports pixel-level (precision, recall, F1, IoU) and instance-level (Hungarian matching) metrics.
+
+### 3. Automatic hyperparameter tuning
+
+```bash
+python tune_params.py
+```
+
+This runs a grid search over 864 parameter combinations in a **single run**:
+
+| Parameter | Values tested |
+|-----------|--------------|
+| `BOX_THRESHOLD` | 0.15, 0.2, 0.25, 0.3, 0.35, 0.4 |
+| `MAX_BOX_AREA_RATIO` | 0.03, 0.05, 0.07, 0.1 |
+| `MIN_TRACK_LENGTH` | 1, 3, 5, 10 |
+| `TRACK_IOU_THRESHOLD` | 0.2, 0.3, 0.4 |
+| `MAX_TRACK_GAP` | 1, 2, 3 |
+
+**How it works efficiently:**
+1. Grounding DINO runs **once** on all frames at the lowest threshold, caching every possible detection
+2. For each combo, filtering + tracking is replayed in pure Python (instant)
+3. SAM2 runs only on the ~20 labelme frames per combo
+
+**Output:** The script reports the best parameter combo for **every metric** in one run — no need to re-run with different flags. Example output:
+
+```
+BEST PARAMETERS PER METRIC (single run — no need to re-run)
+========================================================
+
+  pixel_precision = 0.9120
+    BoxTh=0.40  MaxArea=0.03  MinTrk=10  TrkIoU=0.40  MaxGap=1
+
+  pixel_f1 = 0.8450
+    BoxTh=0.25  MaxArea=0.07  MinTrk=5   TrkIoU=0.30  MaxGap=2
+
+  inst_f1 = 0.8100
+    BoxTh=0.30  MaxArea=0.05  MinTrk=3   TrkIoU=0.30  MaxGap=2
+```
+
+The `--metric` flag only controls which metric the **top-K table** is sorted by (default: `pixel_f1`). All metrics are always computed and shown.
+
+Full results are saved to `data/output/tuning_results.json`.
+
+Copy the best parameters back into `bubbles_detection_pipeline.py` and re-run the pipeline.
 
 ---
 
-## Tuning
+## Manual Tuning Guide
 
 | Problem | Solution |
 |---------|----------|
