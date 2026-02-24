@@ -29,14 +29,14 @@ SOURCE_VIDEO_FRAME_DIR = "./data/frames/custom_video_frames"
 SAVE_TRACKING_RESULTS_DIR = "./data/output/tracking_results"
 SAVE_MASKS_DIR = "./data/output/masks"
 OUTPUT_JSON_PATH = "./data/output/detections.json"
-BOX_THRESHOLD = 0.35  # confidence threshold for Grounding DINO boxes
-MAX_BOX_AREA_RATIO = 0.07  # filter out boxes larger than 5% of image area
+BOX_THRESHOLD = 0.25  # confidence threshold for Grounding DINO boxes
+MAX_BOX_AREA_RATIO = 0.03  # filter out boxes larger than 5% of image area
 DETECT_INTERVAL = 1  # run detection every N frames (1 = every frame)
 
 # Temporal filtering parameters
-MIN_TRACK_LENGTH = 5       # minimum frames a track must span to be kept
-TRACK_IOU_THRESHOLD = 0.3  # min IoU to link detections across consecutive frames
-MAX_TRACK_GAP = 2          # max frames a track can go unmatched before ending
+MIN_TRACK_LENGTH = 10       # minimum frames a track must span to be kept
+TRACK_IOU_THRESHOLD = 0.2  # min IoU to link detections across consecutive frames
+MAX_TRACK_GAP = 1          # max frames a track can go unmatched before ending
 
 # Grounding DINO model from HuggingFace (auto-downloads weights on first run)
 GDINO_MODEL_ID = "IDEA-Research/grounding-dino-base"  # or "IDEA-Research/grounding-dino-tiny"
