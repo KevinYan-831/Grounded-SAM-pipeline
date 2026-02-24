@@ -29,9 +29,14 @@ SOURCE_VIDEO_FRAME_DIR = "./data/frames/custom_video_frames"
 SAVE_TRACKING_RESULTS_DIR = "./data/output/tracking_results"
 SAVE_MASKS_DIR = "./data/output/masks"
 OUTPUT_JSON_PATH = "./data/output/detections.json"
-BOX_THRESHOLD = 0.2
-MAX_BOX_AREA_RATIO = 0.05  # filter out boxes larger than 5% of image area
+BOX_THRESHOLD = 0.35  # confidence threshold for Grounding DINO boxes
+MAX_BOX_AREA_RATIO = 0.07  # filter out boxes larger than 5% of image area
 DETECT_INTERVAL = 1  # run detection every N frames (1 = every frame)
+
+# Temporal filtering parameters
+MIN_TRACK_LENGTH = 10       # minimum frames a track must span to be kept
+TRACK_IOU_THRESHOLD = 0.3  # min IoU to link detections across consecutive frames
+MAX_TRACK_GAP = 2          # max frames a track can go unmatched before ending
 
 # Grounding DINO model from HuggingFace (auto-downloads weights on first run)
 GDINO_MODEL_ID = "IDEA-Research/grounding-dino-base"  # or "IDEA-Research/grounding-dino-tiny"
@@ -172,8 +177,123 @@ print(f"\nFirst frame with detections: {start_frame_idx}")
 print(f"Will process frames {start_frame_idx}-{num_frames - 1} (every {DETECT_INTERVAL} frames)")
 
 """
-Step 5: Per-frame detection + SAM2 segmentation
+Step 5: Pass 1 — Detection only (Grounding DINO on all frames)
 """
+print("\n--- Pass 1: Running detection on all frames ---")
+raw_detections = {}  # frame_idx -> (boxes, names, scores)
+
+frames_to_process = list(range(start_frame_idx, num_frames, DETECT_INTERVAL))
+for frame_idx in tqdm(frames_to_process, desc="Pass 1: Detect"):
+    boxes, names, scores = detect_on_frame(frame_idx)
+    raw_detections[frame_idx] = (boxes, names, scores)
+
+total_raw = sum(len(v[0]) for v in raw_detections.values())
+print(f"Pass 1 complete: {total_raw} raw detections across {len(frames_to_process)} frames")
+
+
+"""
+Step 6: Build tracks via IoU matching and filter short tracks
+"""
+
+
+def box_iou(box_a, box_b):
+    """Compute IoU between two [x1, y1, x2, y2] boxes."""
+    x1 = max(box_a[0], box_b[0])
+    y1 = max(box_a[1], box_b[1])
+    x2 = min(box_a[2], box_b[2])
+    y2 = min(box_a[3], box_b[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+    area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+# Each track: {"id": int, "entries": [(frame_idx, det_idx, box, name, score), ...], "last_frame": int, "last_box": list}
+active_tracks = []
+finished_tracks = []
+next_track_id = 0
+
+for frame_idx in frames_to_process:
+    boxes, names, scores = raw_detections[frame_idx]
+
+    # Mark which detections and tracks get matched
+    matched_det = set()
+    matched_track = set()
+
+    if active_tracks and boxes:
+        # Compute all (track, detection) IoU pairs
+        iou_pairs = []
+        for ti, track in enumerate(active_tracks):
+            for di, det_box in enumerate(boxes):
+                iou_val = box_iou(track["last_box"], det_box)
+                if iou_val >= TRACK_IOU_THRESHOLD:
+                    iou_pairs.append((iou_val, ti, di))
+
+        # Greedy matching: highest IoU first
+        iou_pairs.sort(key=lambda x: x[0], reverse=True)
+        for iou_val, ti, di in iou_pairs:
+            if ti in matched_track or di in matched_det:
+                continue
+            # Extend the track
+            track = active_tracks[ti]
+            track["entries"].append((frame_idx, di, boxes[di], names[di], scores[di]))
+            track["last_frame"] = frame_idx
+            track["last_box"] = boxes[di]
+            matched_track.add(ti)
+            matched_det.add(di)
+
+    # Finalize tracks that have gone stale (not matched for MAX_TRACK_GAP frames)
+    still_active = []
+    for ti, track in enumerate(active_tracks):
+        gap = (frame_idx - track["last_frame"]) // max(1, DETECT_INTERVAL)
+        if ti not in matched_track and gap >= MAX_TRACK_GAP:
+            finished_tracks.append(track)
+        else:
+            still_active.append(track)
+    active_tracks = still_active
+
+    # Start new tracks for unmatched detections
+    for di in range(len(boxes)):
+        if di not in matched_det:
+            active_tracks.append({
+                "id": next_track_id,
+                "entries": [(frame_idx, di, boxes[di], names[di], scores[di])],
+                "last_frame": frame_idx,
+                "last_box": boxes[di],
+            })
+            next_track_id += 1
+
+# Finalize all remaining active tracks
+finished_tracks.extend(active_tracks)
+active_tracks = []
+
+# Filter: keep only tracks with enough frames
+all_tracks = finished_tracks
+valid_tracks = [t for t in all_tracks if len(t["entries"]) >= MIN_TRACK_LENGTH]
+
+print(f"\nTracking: {len(all_tracks)} total tracks, {len(valid_tracks)} kept (>= {MIN_TRACK_LENGTH} frames)")
+for t in valid_tracks:
+    print(f"  Track {t['id']:>3d}: {len(t['entries'])} frames "
+          f"(frames {t['entries'][0][0]}-{t['entries'][-1][0]})")
+
+# Build lookup: frame_idx -> list of (box, name, score, track_id)
+filtered_detections = {}
+for track in valid_tracks:
+    for (fidx, di, box, name, score) in track["entries"]:
+        if fidx not in filtered_detections:
+            filtered_detections[fidx] = []
+        filtered_detections[fidx].append((box, name, score, track["id"]))
+
+total_filtered = sum(len(v) for v in filtered_detections.values())
+print(f"After filtering: {total_filtered} detections across {len(filtered_detections)} frames "
+      f"(removed {total_raw - total_filtered} transient detections)")
+
+
+"""
+Step 7: Pass 2 — SAM2 segmentation on filtered detections
+"""
+print("\n--- Pass 2: Running SAM2 segmentation on filtered detections ---")
 os.makedirs(SAVE_MASKS_DIR, exist_ok=True)
 os.makedirs(SAVE_TRACKING_RESULTS_DIR, exist_ok=True)
 
@@ -183,13 +303,15 @@ mask_annotator = sv.MaskAnnotator()
 
 all_frame_detections = []
 
-frames_to_process = range(start_frame_idx, num_frames, DETECT_INTERVAL)
-for frame_idx in tqdm(frames_to_process, desc="Detect + Segment"):
+for frame_idx in tqdm(frames_to_process, desc="Pass 2: Segment"):
     img_path = os.path.join(SOURCE_VIDEO_FRAME_DIR, frame_names[frame_idx])
     img_bgr = cv2.imread(img_path)
 
-    # --- Local Grounding DINO detection ---
-    input_boxes, class_names, conf_scores = detect_on_frame(frame_idx)
+    frame_dets = filtered_detections.get(frame_idx, [])
+    input_boxes = [d[0] for d in frame_dets]
+    class_names = [d[1] for d in frame_dets]
+    conf_scores = [d[2] for d in frame_dets]
+    track_ids = [d[3] for d in frame_dets]
 
     frame_record = {
         "frame_index": frame_idx,
@@ -219,7 +341,6 @@ for frame_idx in tqdm(frames_to_process, desc="Detect + Segment"):
     if masks.ndim == 4:
         masks = masks.squeeze(1)
 
-    # ensure masks are boolean for supervision annotators
     masks = masks.astype(bool)
 
     # --- Collect per-bubble info ---
@@ -228,6 +349,7 @@ for frame_idx in tqdm(frames_to_process, desc="Detect + Segment"):
         mask_area = int(masks[i].sum())
         bubble_info = {
             "id": i,
+            "track_id": track_ids[i],
             "label": class_names[i],
             "confidence": conf_scores[i],
             "bbox": [round(c, 2) for c in bbox],
@@ -242,21 +364,33 @@ for frame_idx in tqdm(frames_to_process, desc="Detect + Segment"):
     np.save(os.path.join(SAVE_MASKS_DIR, f"{frame_idx:05d}.npy"), masks.astype(np.uint8))
 
     # --- Visualize ---
+    labels = [f"{name} T{tid}" for name, tid in zip(class_names, track_ids)]
     detections = sv.Detections(
         xyxy=sv.mask_to_xyxy(masks),
         mask=masks,
-        class_id=np.arange(len(masks), dtype=np.int32),
+        class_id=np.array(track_ids, dtype=np.int32),
     )
     annotated = box_annotator.annotate(scene=img_bgr.copy(), detections=detections)
-    annotated = label_annotator.annotate(annotated, detections=detections, labels=class_names)
+    annotated = label_annotator.annotate(annotated, detections=detections, labels=labels)
     annotated = mask_annotator.annotate(scene=annotated, detections=detections)
     cv2.imwrite(os.path.join(SAVE_TRACKING_RESULTS_DIR, f"annotated_frame_{frame_idx:05d}.jpg"), annotated)
 
+
 """
-Step 6: Save detection results as JSON
+Step 8: Save detection results as JSON
 """
 total_bubbles = sum(f["num_bubbles"] for f in all_frame_detections)
 frames_with_detections = sum(1 for f in all_frame_detections if f["num_bubbles"] > 0)
+
+# Track summary
+track_summary = []
+for t in valid_tracks:
+    track_summary.append({
+        "track_id": t["id"],
+        "num_frames": len(t["entries"]),
+        "first_frame": t["entries"][0][0],
+        "last_frame": t["entries"][-1][0],
+    })
 
 detection_output = {
     "video_path": VIDEO_PATH,
@@ -264,12 +398,18 @@ detection_output = {
     "model": GDINO_MODEL_ID,
     "box_threshold": BOX_THRESHOLD,
     "max_box_area_ratio": MAX_BOX_AREA_RATIO,
+    "min_track_length": MIN_TRACK_LENGTH,
+    "track_iou_threshold": TRACK_IOU_THRESHOLD,
     "image_size": {"width": img_w, "height": img_h},
     "total_frames_processed": len(all_frame_detections),
     "frames_with_detections": frames_with_detections,
     "total_bubbles_detected": total_bubbles,
+    "raw_detections_before_filter": total_raw,
+    "total_tracks": len(all_tracks),
+    "valid_tracks": len(valid_tracks),
     "start_frame_index": start_frame_idx,
     "detect_interval": DETECT_INTERVAL,
+    "tracks": track_summary,
     "frames": all_frame_detections,
 }
 
@@ -278,7 +418,8 @@ with open(OUTPUT_JSON_PATH, "w") as f:
     json.dump(detection_output, f, indent=2)
 print(f"\nDetection results saved to {OUTPUT_JSON_PATH}")
 
+
 """
-Step 7: Convert annotated frames to video
+Step 9: Convert annotated frames to video
 """
 create_video_from_images(SAVE_TRACKING_RESULTS_DIR, OUTPUT_VIDEO_PATH)
