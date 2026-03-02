@@ -1,0 +1,92 @@
+# ==============================================================================
+# Labeling Rules Configuration
+# Modify this file to adjust how frames are classified into process states.
+# ==============================================================================
+
+# --- Detection (Grounding DINO) ---
+# A single "bubble.pore" prompt detects both bubbles and keyholes.
+# They are split by shape: tall/skinny detections → keyhole, others → bubble.
+detection:
+  bubble:
+    text_prompt: "bubble.pore"
+    box_threshold: 0.25
+    max_box_area_ratio: 0.03
+
+  keyhole:
+    # Shape criteria for splitting keyhole from bubble detections.
+    # Detections with AR >= min_aspect_ratio AND height >= min_height are keyhole.
+    min_aspect_ratio: 1.5
+    min_height: 80
+    box_threshold: 0.15          # lower threshold to catch more keyholes
+    max_box_area_ratio: 0.10     # keyholes can be larger than bubbles
+
+# --- Keyhole Trajectory Post-Processing ---
+# After GDINO detects sparse keyhole positions, the trajectory is cleaned up:
+# temporal filtering → outlier rejection → gap interpolation → smoothing.
+keyhole_trajectory:
+  max_jump_px: 120              # reject detections whose cx jumps more than this
+  median_window: 30             # local median window (frames) for outlier rejection
+  smoothing_window: 5           # rolling average for final positions
+  first_frame_min_x: 100        # real keyhole starts at x > this (filter early artifacts)
+
+# --- Tracking Parameters ---
+tracking:
+  track_iou_threshold: 0.2
+  max_track_gap: 2
+  keyhole_min_track_length: 3
+  bubble_min_track_length: 1    # keep even single-frame transient bubbles
+
+# --- Proximity Classification ---
+# Determines whether a bubble is "near" or "far" from the keyhole.
+proximity:
+  # Method: "center_distance" or "edge_distance"
+  method: "center_distance"
+  # Distance threshold (pixels) — bubbles within this distance are "near keyhole"
+  near_threshold_pixels: 150
+
+# --- Track Duration Classification ---
+# Determines whether a bubble track is "transient" or "permanent".
+track_classification:
+  # Tracks shorter than this (in frames) are "transient"
+  transient_max_frames: 30
+  # Tracks at least this long (in frames) are "permanent"
+  permanent_min_frames: 30
+
+# --- Label Definitions (5 categories) ---
+labels:
+  no_signal:
+    id: 0
+    name: "No Signal"
+    description: "No keyhole detected in the frame"
+    color: [128, 128, 128]   # gray
+
+  normal_process:
+    id: 1
+    name: "Normal Process"
+    description: "Keyhole present, and NO bubbles exist anywhere in the entire video"
+    color: [0, 255, 0]       # green
+
+  unstable_no_pore:
+    id: 2
+    name: "Unstable Process without Pore Generation"
+    description: "Keyhole present, no bubbles at this frame, but bubbles exist elsewhere in the video"
+    color: [255, 255, 0]     # yellow
+
+  transient_pore:
+    id: 3
+    name: "Transient Pore Generation"
+    description: "A bubble at this frame that will eventually disappear (transient track)"
+    color: [255, 165, 0]     # orange
+
+  permanent_pore:
+    id: 4
+    name: "Permanent Pore Generation"
+    description: "A bubble at this frame that stays permanently (permanent track)"
+    color: [255, 0, 0]       # red
+
+# --- Interval Grouping ---
+intervals:
+  # Minimum frames for an interval to be kept (shorter runs are merged into neighbors)
+  min_interval_length: 1
+  # Majority-vote smoothing window to reduce label flickering between frames
+  smoothing_window: 5

@@ -23,7 +23,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 Hyperparameters
 """
 VIDEO_PATH = "./data/raw/x_ray_video.mp4"
-TEXT_PROMPT = "bubble.pore"
+TEXT_PROMPT = "bubble"
 OUTPUT_VIDEO_PATH = "./data/output/bubbles_groundedSAM.mp4"
 SOURCE_VIDEO_FRAME_DIR = "./data/frames/custom_video_frames"
 SAVE_TRACKING_RESULTS_DIR = "./data/output/tracking_results"

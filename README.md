@@ -88,9 +88,12 @@ Each surviving bubble gets a consistent `track_id` across all frames it appears 
 
 ```
 Grounded-SAM-pipeline/
-├── bubbles_detection_pipeline.py   # Main pipeline (two-pass + temporal filtering)
+├── bubbles_detection_pipeline.py   # Detection pipeline (two-pass + temporal filtering)
+├── labeling_pipeline.py            # Frame labeling pipeline (5-category classification)
+├── labeling_rules.yaml             # Configurable rules for the labeling pipeline
 ├── evaluate.py                     # Evaluation against labelme ground truth
 ├── tune_params.py                  # Automatic hyperparameter grid search
+├── test_keyhole_prompts.py         # Utility to test GDINO prompts for keyhole detection
 ├── setup.py                        # SAM 2 package setup
 ├── pyproject.toml                  # Build system config
 ├── checkpoints/
@@ -98,16 +101,20 @@ Grounded-SAM-pipeline/
 │   └── sam2.1_hiera_*.pt           # SAM 2.1 checkpoints (not tracked)
 ├── sam2/                           # SAM 2 library source
 ├── utils/
-│   └── video_utils.py              # Video creation utility
+│   ├── video_utils.py              # Video creation utility
+│   ├── detection_utils.py          # Shared detection & tracking functions
+│   └── keyhole_detector.py         # Classical-CV keyhole detector
 └── data/                           # Data directory (not tracked)
     ├── raw/                        # Input videos
     ├── frames/custom_video_frames/ # Extracted & cropped frames
-    ├── output/
-    │   ├── detections.json         # Detection results with track IDs
-    │   ├── tuning_results.json    # Grid search results (from tune_params.py)
-    │   ├── masks/                  # Raw mask .npy files per frame
-    │   ├── tracking_results/       # Annotated frame images
-    │   └── bubbles_groundedSAM.mp4 # Output video
+    ├── output/                     # Detection pipeline output
+    │   ├── detections.json
+    │   ├── masks/
+    │   ├── tracking_results/
+    │   └── bubbles_groundedSAM.mp4
+    ├── labeling/                   # Labeling pipeline output
+    │   ├── labeling_results.json   # Per-frame labels, intervals, track metadata
+    │   └── frames/                 # Annotated frames with label overlays
     └── labelme/                    # Ground truth annotations
 ```
 
@@ -257,6 +264,62 @@ python bubbles_detection_pipeline.py
   ]
 }
 ```
+
+---
+
+## Frame Labeling Pipeline
+
+A separate pipeline that classifies each video frame into one of 5 process states based on keyhole presence and bubble behavior.
+
+### Label categories
+
+| ID | Label | Description |
+|----|-------|-------------|
+| 0 | No Signal | No keyhole detected in the frame |
+| 1 | Normal Process | Entire trajectory has no permanent pore |
+| 2 | Unstable Process without Pore Generation | Trajectory has permanent pores, but none at this frame |
+| 3 | Transient Pore Generation | A pore at this frame that will disappear |
+| 4 | Permanent Pore Generation | A pore at this frame that stays permanently |
+
+### How it works
+
+1. **Keyhole detection (classical CV)** — Local background subtraction finds the keyhole as a dark vertical feature extending from the top of the image. Temporal filtering and interpolation produce a smooth keyhole trajectory across all frames. No GDINO prompt needed.
+2. **Bubble detection (Grounding DINO)** — Standard `"bubble.pore"` prompt detects all bubbles.
+3. **Track building** — IoU-based tracking links bubble detections into tracks.
+4. **Classification** — Each bubble track is classified by proximity to the keyhole (near/far) and persistence (transient/permanent).
+5. **Per-frame labeling** — A decision tree assigns one of 5 labels to each frame, then majority-vote smoothing reduces label flickering.
+6. **Output** — JSON results with per-frame labels, time intervals, and track metadata, plus annotated frame images.
+
+### Running
+
+```bash
+# If frames are already extracted (from the detection pipeline):
+python labeling_pipeline.py --skip-extraction
+
+# Full run (extracts frames from video first):
+python labeling_pipeline.py
+
+# Custom config:
+python labeling_pipeline.py --config my_rules.yaml --skip-extraction
+```
+
+### Configuration
+
+All labeling parameters are in `labeling_rules.yaml`. Key sections:
+
+- **`keyhole_cv`** — CV-based keyhole detection (Gaussian sigma, thresholds, temporal filtering)
+- **`detection.bubble`** — Grounding DINO prompt and thresholds
+- **`proximity`** — Distance threshold for near/far keyhole classification
+- **`track_classification`** — Frame count thresholds for transient/permanent
+- **`labels`** — Label names, IDs, colors, descriptions
+- **`intervals`** — Smoothing window, minimum interval length
+
+### Output
+
+| File | Description |
+|------|-------------|
+| `data/labeling/labeling_results.json` | Per-frame labels, intervals, bubble track metadata, keyhole positions |
+| `data/labeling/frames/*.jpg` | Annotated frames with colored label bar, keyhole box (white), bubble boxes (red/orange/cyan) |
 
 ---
 
