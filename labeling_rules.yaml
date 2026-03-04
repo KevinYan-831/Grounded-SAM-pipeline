@@ -38,9 +38,18 @@ keyhole_trajectory:
 # --- Tracking Parameters ---
 tracking:
   track_iou_threshold: 0.2
-  max_track_gap: 2
+  max_track_gap: 5              # frames a track can go undetected before ending
   keyhole_min_track_length: 3
   bubble_min_track_length: 1    # keep even single-frame transient bubbles
+
+# --- Track Merging ---
+# GDINO sometimes misses a bubble for several frames, splitting one permanent
+# bubble into multiple short (transient) tracks. Post-processing merges
+# spatially close tracks with a short temporal gap into one combined track.
+track_merging:
+  enabled: true
+  max_gap_frames: 30            # merge tracks separated by at most this many frames
+  max_distance_px: 50           # merge tracks whose endpoints are within this distance
 
 # --- Proximity Classification ---
 # Determines whether a bubble is "near" or "far" from the keyhole.

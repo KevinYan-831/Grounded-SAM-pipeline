@@ -196,19 +196,24 @@ def split_keyhole_and_bubbles(all_detections, config, img_h, img_w):
 # Optional: SAM2 point-prompt refinement of keyhole bboxes
 # ─────────────────────────────────────────────────────────────
 def refine_keyhole_with_sam(
-    keyhole_raw, frame_names, source_dir, image_predictor, device,
+    keyhole_raw, frame_names, source_dir, image_predictor, device, config,
 ):
     """
     For each frame in keyhole_raw, pass the approximate keyhole center
     as a point prompt to SAM2 and replace the bounding box with the one
     derived from the SAM mask.  This gives more precise keyhole bounds.
 
+    The SAM output is validated against the same shape constraints used
+    during detection.  If SAM produces an oversized or malformed box
+    (e.g. full-screen segment), the original GDINO box is kept instead.
+
     Args:
-        keyhole_raw: {frame_idx: dict(x, y, w, h, cx, cy, score)}
-        frame_names: sorted list of frame filenames
-        source_dir:  directory containing frames
+        keyhole_raw:     {frame_idx: dict(x, y, w, h, cx, cy, score)}
+        frame_names:     sorted list of frame filenames
+        source_dir:      directory containing frames
         image_predictor: SAM2ImagePredictor instance
-        device: torch device string
+        device:          torch device string
+        config:          full labeling_rules config dict (for shape constraints)
 
     Returns:
         Refined keyhole_raw dict (same keys, updated bbox entries).
@@ -216,9 +221,17 @@ def refine_keyhole_with_sam(
     import torch
     from PIL import Image as PILImage
 
+    kh_cfg    = config["detection"]["keyhole"]
+    min_h     = kh_cfg["min_height"]
+    max_w     = kh_cfg.get("max_width", float("inf"))
+    min_ar    = kh_cfg.get("min_aspect_ratio", 0.0)
+    max_top_y = kh_cfg.get("max_top_y", float("inf"))
+
+    fallback_count = 0
     refined = {}
+
     for fidx in tqdm(sorted(keyhole_raw.keys()), desc="SAM keyhole refinement"):
-        kh = keyhole_raw[fidx]
+        kh    = keyhole_raw[fidx]
         fpath = os.path.join(source_dir, frame_names[fidx])
         img_pil = PILImage.open(fpath).convert("RGB")
         img_np  = np.array(img_pil)
@@ -243,7 +256,6 @@ def refine_keyhole_with_sam(
 
             y_idx, x_idx = np.where(mask)
             if len(x_idx) == 0:
-                # SAM found nothing — keep GDINO bbox
                 refined[fidx] = kh
                 continue
 
@@ -251,18 +263,123 @@ def refine_keyhole_with_sam(
             y1 = float(y_idx.min())
             x2 = float(x_idx.max())
             y2 = float(y_idx.max())
-            refined[fidx] = {
-                "x": x1, "y": y1,
-                "w": x2 - x1, "h": y2 - y1,
-                "cx": (x1 + x2) / 2.0,
-                "cy": (y1 + y2) / 2.0,
-                "score": kh["score"],
-            }
+            w_sam = x2 - x1
+            h_sam = y2 - y1
+            ar_sam = h_sam / w_sam if w_sam > 0 else 0.0
+
+            # Validate SAM bbox with the same shape constraints as detection.
+            # If SAM segments a huge region (e.g. full screen), fall back
+            # to the original GDINO box which already passed these checks.
+            if (h_sam >= min_h and
+                    w_sam <= max_w and
+                    ar_sam >= min_ar and
+                    y1 <= max_top_y):
+                refined[fidx] = {
+                    "x": x1, "y": y1,
+                    "w": w_sam, "h": h_sam,
+                    "cx": (x1 + x2) / 2.0,
+                    "cy": (y1 + y2) / 2.0,
+                    "score": kh["score"],
+                }
+            else:
+                refined[fidx] = kh  # SAM box too large — keep GDINO bbox
+                fallback_count += 1
+
         except Exception as e:
             print(f"  SAM failed on frame {fidx}: {e} — keeping GDINO bbox")
             refined[fidx] = kh
+            fallback_count += 1
 
+    if fallback_count:
+        print(f"  SAM refinement: kept GDINO bbox on {fallback_count} frames "
+              f"(SAM output failed shape constraints)")
     return refined
+
+
+# ─────────────────────────────────────────────────────────────
+# Merge fragmented bubble tracks
+# ─────────────────────────────────────────────────────────────
+def merge_fragmented_tracks(tracks, config):
+    """
+    Merge tracks that belong to the same physical bubble but were split
+    because GDINO missed detections for several frames.
+
+    Two tracks are merged when:
+      • The time gap between them is <= max_gap_frames
+      • The spatial distance between the last box of the earlier track and
+        the first box of the later track is <= max_distance_px
+
+    Merged tracks inherit the ID of the earlier track.  The combined entry
+    list is sorted by frame index so downstream code sees a single track.
+
+    Args:
+        tracks: list of track dicts (from build_and_filter_tracks)
+        config: full labeling_rules config dict
+
+    Returns:
+        List of merged track dicts.
+    """
+    merge_cfg = config.get("track_merging", {})
+    if not merge_cfg.get("enabled", False) or not tracks:
+        return tracks
+
+    max_gap  = merge_cfg.get("max_gap_frames", 30)
+    max_dist = merge_cfg.get("max_distance_px", 50)
+
+    # Sort tracks by their first frame
+    sorted_tracks = sorted(tracks, key=lambda t: t["entries"][0][0])
+    merged_flags  = [False] * len(sorted_tracks)
+    result        = []
+
+    for i, track_i in enumerate(sorted_tracks):
+        if merged_flags[i]:
+            continue
+
+        combined_entries = list(track_i["entries"])
+        last_frame = track_i["entries"][-1][0]
+        last_box   = track_i["entries"][-1][1]
+
+        for j in range(i + 1, len(sorted_tracks)):
+            if merged_flags[j]:
+                continue
+            track_j      = sorted_tracks[j]
+            first_frame_j = track_j["entries"][0][0]
+            first_box_j   = track_j["entries"][0][1]
+
+            gap = first_frame_j - last_frame
+            if gap > max_gap:
+                break  # tracks are sorted; no later track can be closer
+
+            # Spatial distance between endpoints
+            lcx = (last_box[0] + last_box[2]) / 2
+            lcy = (last_box[1] + last_box[3]) / 2
+            fcx = (first_box_j[0] + first_box_j[2]) / 2
+            fcy = (first_box_j[1] + first_box_j[3]) / 2
+            dist = np.sqrt((lcx - fcx) ** 2 + (lcy - fcy) ** 2)
+
+            if dist <= max_dist:
+                combined_entries.extend(track_j["entries"])
+                merged_flags[j] = True
+                # Update last known position for chained merging
+                last_frame = track_j["entries"][-1][0]
+                last_box   = track_j["entries"][-1][1]
+
+        combined_entries.sort(key=lambda e: e[0])
+        result.append({
+            **track_i,
+            "entries":    combined_entries,
+            "last_frame": combined_entries[-1][0],
+            "last_box":   combined_entries[-1][1],
+        })
+
+    n_before = len(tracks)
+    n_after  = len(result)
+    if n_before != n_after:
+        print(f"  Track merging: {n_before} → {n_after} tracks "
+              f"({n_before - n_after} fragments merged)")
+    else:
+        print(f"  Track merging: no fragments to merge ({n_after} tracks)")
+    return result
 
 
 # ─────────────────────────────────────────────────────────────
@@ -759,7 +876,7 @@ def main():
         else:
             keyhole_raw = refine_keyhole_with_sam(
                 keyhole_raw, frame_names, SOURCE_VIDEO_FRAME_DIR,
-                image_predictor, device,
+                image_predictor, device, config,
             )
 
     # ── Build keyhole trajectory ──────────────────────────────────
@@ -783,6 +900,10 @@ def main():
         min_track_length    = track_cfg["bubble_min_track_length"],
     )
     print(f"  Bubble tracks after filtering: {len(bubble_tracks)}")
+
+    # ── Merge fragmented bubble tracks ────────────────────────────
+    print("\n--- Merging fragmented bubble tracks ---")
+    bubble_tracks = merge_fragmented_tracks(bubble_tracks, config)
 
     # ── Classify bubble tracks ────────────────────────────────────
     print("\n--- Classifying bubble tracks ---")
