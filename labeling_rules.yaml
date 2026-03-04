@@ -13,10 +13,13 @@ detection:
     max_box_area_ratio: 0.03
 
   keyhole:
-    # Among all GDINO detections in a frame, the leftmost one whose height
-    # >= min_height is treated as the keyhole candidate. Everything else
-    # is classified as a bubble.
-    min_height: 50               # minimum px height to be a keyhole candidate
+    # Among all GDINO detections in a frame, the leftmost one that passes
+    # ALL of the shape constraints below is treated as the keyhole candidate.
+    # Everything else is classified as a bubble.
+    min_height: 50               # minimum px height (keyhole is tall)
+    max_width: 100               # maximum px width  (keyhole is narrow)
+    min_aspect_ratio: 1.5        # h/w must be >= this (taller than wide)
+    max_top_y: 20                # y1 of box must be <= this (keyhole starts at image top)
     box_threshold: 0.15          # lower threshold so dim keyholes are not missed
     max_box_area_ratio: 0.10     # keyholes can be larger than bubbles
     # If true, use SAM2 point-prompt segmentation to refine the keyhole bbox

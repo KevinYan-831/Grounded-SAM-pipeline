@@ -112,9 +112,15 @@ def split_keyhole_and_bubbles(all_detections, config, img_h, img_w):
 
     Strategy: the keyhole sits at the leading edge of the weld pool and
     moves right→left over time.  In any given frame, the LEFTMOST detection
-    that is sufficiently tall (height >= min_height) and passes the keyhole
-    score threshold is the keyhole candidate.  All other detections that
-    pass the bubble threshold and area filter are classified as bubbles.
+    that passes ALL shape constraints is the keyhole candidate.  All other
+    detections that pass the bubble threshold and area filter are bubbles.
+
+    Shape constraints for keyhole candidates:
+      • height  >= min_height      (keyhole is tall)
+      • width   <= max_width       (keyhole is narrow — rejects huge boxes)
+      • h/w     >= min_aspect_ratio (taller than wide — rejects wide boxes)
+      • y1      <= max_top_y       (keyhole extends from image top)
+      • score   >= box_threshold
 
     Returns:
         keyhole_raw: {frame_idx: dict(x, y, w, h, cx, cy, score)}
@@ -124,7 +130,10 @@ def split_keyhole_and_bubbles(all_detections, config, img_h, img_w):
     kh_cfg = config["detection"]["keyhole"]
     img_area = img_h * img_w
 
-    min_h        = kh_cfg["min_height"]
+    min_h     = kh_cfg["min_height"]
+    max_w     = kh_cfg.get("max_width", float("inf"))
+    min_ar    = kh_cfg.get("min_aspect_ratio", 0.0)
+    max_top_y = kh_cfg.get("max_top_y", float("inf"))
     kh_threshold = kh_cfg["box_threshold"]
     bb_threshold = bb_cfg["box_threshold"]
     bb_max_area  = bb_cfg["max_box_area_ratio"]
@@ -133,17 +142,23 @@ def split_keyhole_and_bubbles(all_detections, config, img_h, img_w):
     bubble_detections = {}
 
     for fidx, (boxes, names, scores) in all_detections.items():
-        # --- find keyhole: leftmost detection with h >= min_h ---
-        kh_best   = None
+        # --- find keyhole: leftmost detection passing all shape constraints ---
+        kh_best    = None
         kh_best_x1 = float("inf")
 
         for box, name, score in zip(boxes, names, scores):
             x1, y1, x2, y2 = box
             h_px = y2 - y1
-            if h_px >= min_h and score >= kh_threshold:
+            w_px = x2 - x1
+            ar   = h_px / w_px if w_px > 0 else 0.0
+
+            if (h_px >= min_h and
+                    w_px <= max_w and
+                    ar   >= min_ar and
+                    y1   <= max_top_y and
+                    score >= kh_threshold):
                 if x1 < kh_best_x1:
                     kh_best_x1 = x1
-                    w_px = x2 - x1
                     kh_best = {
                         "x": x1, "y": y1, "w": w_px, "h": h_px,
                         "cx": (x1 + x2) / 2.0, "cy": (y1 + y2) / 2.0,
