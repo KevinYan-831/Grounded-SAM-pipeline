@@ -2,20 +2,27 @@
 Frame labeling pipeline for bubble detection in X-ray video.
 
 Assigns per-frame state labels based on keyhole presence, bubble proximity
-to the keyhole, and track persistence. Outputs a labeled interval dataset
+to the keyhole, and track persistence.  Outputs a labeled interval dataset
 as JSON.
 
+Keyhole detection uses Grounding DINO ("bubble.pore" prompt) — the same
+model used for bubbles.  Detections are split by shape:
+  • leftmost detection with h ≥ min_height                  → keyhole
+  • everything else                                          → bubble
+
 Labels:
-  0 - No Signal
-  1 - Normal Process
-  2 - Unstable Process without Pore Generation
-  3 - Transient Pore Generation
-  4 - Permanent Pore Generation
+  0 - No Signal:                      No keyhole detected
+  1 - Normal Process:                 Keyhole present, NO bubbles in entire video
+  2 - Unstable without Pore:          Keyhole present, no bubble this frame, but
+                                      bubbles exist elsewhere in the video
+  3 - Transient Pore Generation:      Bubble at this frame that will disappear
+  4 - Permanent Pore Generation:      Bubble at this frame that stays permanently
 
 Usage:
     python labeling_pipeline.py
     python labeling_pipeline.py --config custom_rules.yaml
     python labeling_pipeline.py --skip-extraction   # reuse already-extracted frames
+    python labeling_pipeline.py --skip-detection    # reuse cached detections JSON
 """
 
 import os
@@ -32,18 +39,23 @@ from utils.detection_utils import (
     load_models,
     extract_and_crop_frames,
     detect_on_frame,
-    box_iou,
     build_and_filter_tracks,
 )
-from utils.keyhole_detector import detect_keyhole_all_frames
+from utils.keyhole_detector import (
+    _temporal_filter,
+    _find_first_keyhole_frame,
+    _interpolate_positions,
+    _smooth_positions,
+)
 
 # ─────────────────────────────────────────────────────────────
-# Paths (same as detection pipeline)
+# Paths
 # ─────────────────────────────────────────────────────────────
 VIDEO_PATH = "./data/raw/x_ray_video.mp4"
 SOURCE_VIDEO_FRAME_DIR = "./data/frames/custom_video_frames"
 OUTPUT_JSON_PATH = "./data/labeling/labeling_results.json"
 OUTPUT_FRAMES_DIR = "./data/labeling/frames"
+DETECTION_CACHE_PATH = "./data/labeling/raw_detections.json"
 CROP_TOP = 800 - 310  # keep bottom 310 rows
 
 GDINO_MODEL_ID = "IDEA-Research/grounding-dino-base"
@@ -52,37 +64,247 @@ SAM2_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
 
 
 # ─────────────────────────────────────────────────────────────
-# Bubble detection (Grounding DINO)
+# Detection: run GDINO once per frame with wide thresholds
 # ─────────────────────────────────────────────────────────────
-def run_detection(
+def run_all_detections(
     frame_names, source_dir, config, gdino_processor, gdino_model,
     img_h, img_w, device,
 ):
     """
-    Run Grounding DINO once per frame with the bubble text prompt.
-    All objects (keyholes + bubbles) are detected together.
+    Run Grounding DINO on every frame using parameters broad enough to
+    capture both bubbles and keyhole detections.
+
+    We run with the LOWER of the two thresholds and the HIGHER of the two
+    area ratios so that keyhole candidates (lower confidence, larger box)
+    are not filtered out before we can classify them by shape.
 
     Returns:
         all_detections: {frame_idx: (boxes, names, scores)}
     """
     bb_cfg = config["detection"]["bubble"]
-    all_detections = {}
+    kh_cfg = config["detection"]["keyhole"]
 
+    text_prompt = bb_cfg["text_prompt"]
+    detection_threshold = min(bb_cfg["box_threshold"], kh_cfg["box_threshold"])
+    detection_area_ratio = max(bb_cfg["max_box_area_ratio"], kh_cfg["max_box_area_ratio"])
+
+    all_detections = {}
     for fidx in tqdm(range(len(frame_names)), desc="Detection"):
         boxes, names, scores = detect_on_frame(
             fidx, frame_names, source_dir, gdino_processor, gdino_model,
-            bb_cfg["text_prompt"], bb_cfg["box_threshold"],
-            img_h, img_w, bb_cfg["max_box_area_ratio"], device,
+            text_prompt, detection_threshold,
+            img_h, img_w, detection_area_ratio, device,
         )
         all_detections[fidx] = (boxes, names, scores)
 
     total = sum(len(v[0]) for v in all_detections.values())
     frames_with = sum(1 for v in all_detections.values() if len(v[0]) > 0)
-    print(f"Total: {total} detections across {frames_with} frames")
+    print(f"  Total raw detections: {total} across {frames_with} frames")
     return all_detections
 
 
-# (Keyhole detection is now handled by utils/keyhole_detector.py)
+# ─────────────────────────────────────────────────────────────
+# Split detections: leftmost tall object → keyhole, rest → bubble
+# ─────────────────────────────────────────────────────────────
+def split_keyhole_and_bubbles(all_detections, config, img_h, img_w):
+    """
+    Partition GDINO detections into keyhole candidates and bubbles.
+
+    Strategy: the keyhole sits at the leading edge of the weld pool and
+    moves right→left over time.  In any given frame, the LEFTMOST detection
+    that is sufficiently tall (height >= min_height) and passes the keyhole
+    score threshold is the keyhole candidate.  All other detections that
+    pass the bubble threshold and area filter are classified as bubbles.
+
+    Returns:
+        keyhole_raw: {frame_idx: dict(x, y, w, h, cx, cy, score)}
+        bubble_detections: {frame_idx: (boxes, names, scores)}
+    """
+    bb_cfg = config["detection"]["bubble"]
+    kh_cfg = config["detection"]["keyhole"]
+    img_area = img_h * img_w
+
+    min_h        = kh_cfg["min_height"]
+    kh_threshold = kh_cfg["box_threshold"]
+    bb_threshold = bb_cfg["box_threshold"]
+    bb_max_area  = bb_cfg["max_box_area_ratio"]
+
+    keyhole_raw       = {}
+    bubble_detections = {}
+
+    for fidx, (boxes, names, scores) in all_detections.items():
+        # --- find keyhole: leftmost detection with h >= min_h ---
+        kh_best   = None
+        kh_best_x1 = float("inf")
+
+        for box, name, score in zip(boxes, names, scores):
+            x1, y1, x2, y2 = box
+            h_px = y2 - y1
+            if h_px >= min_h and score >= kh_threshold:
+                if x1 < kh_best_x1:
+                    kh_best_x1 = x1
+                    w_px = x2 - x1
+                    kh_best = {
+                        "x": x1, "y": y1, "w": w_px, "h": h_px,
+                        "cx": (x1 + x2) / 2.0, "cy": (y1 + y2) / 2.0,
+                        "score": float(score),
+                    }
+
+        # --- bubbles: everything that is NOT the keyhole box ---
+        bb_boxes, bb_names, bb_scores = [], [], []
+        for box, name, score in zip(boxes, names, scores):
+            x1, y1, x2, y2 = box
+            # Skip the box we picked as keyhole
+            if kh_best is not None and abs(x1 - kh_best["x"]) < 0.5 and abs(y1 - kh_best["y"]) < 0.5:
+                continue
+            if score >= bb_threshold:
+                h_px = y2 - y1
+                w_px = x2 - x1
+                if (h_px * w_px) / img_area <= bb_max_area:
+                    bb_boxes.append(box)
+                    bb_names.append(name)
+                    bb_scores.append(score)
+
+        if kh_best is not None:
+            keyhole_raw[fidx] = kh_best
+        bubble_detections[fidx] = (bb_boxes, bb_names, bb_scores)
+
+    kh_total = len(keyhole_raw)
+    bb_total = sum(len(v[0]) for v in bubble_detections.values())
+    print(f"  Keyhole raw detections: {kh_total} frames")
+    print(f"  Bubble detections:      {bb_total} total across "
+          f"{sum(1 for v in bubble_detections.values() if len(v[0]) > 0)} frames")
+    return keyhole_raw, bubble_detections
+
+
+# ─────────────────────────────────────────────────────────────
+# Optional: SAM2 point-prompt refinement of keyhole bboxes
+# ─────────────────────────────────────────────────────────────
+def refine_keyhole_with_sam(
+    keyhole_raw, frame_names, source_dir, image_predictor, device,
+):
+    """
+    For each frame in keyhole_raw, pass the approximate keyhole center
+    as a point prompt to SAM2 and replace the bounding box with the one
+    derived from the SAM mask.  This gives more precise keyhole bounds.
+
+    Args:
+        keyhole_raw: {frame_idx: dict(x, y, w, h, cx, cy, score)}
+        frame_names: sorted list of frame filenames
+        source_dir:  directory containing frames
+        image_predictor: SAM2ImagePredictor instance
+        device: torch device string
+
+    Returns:
+        Refined keyhole_raw dict (same keys, updated bbox entries).
+    """
+    import torch
+    from PIL import Image as PILImage
+
+    refined = {}
+    for fidx in tqdm(sorted(keyhole_raw.keys()), desc="SAM keyhole refinement"):
+        kh = keyhole_raw[fidx]
+        fpath = os.path.join(source_dir, frame_names[fidx])
+        img_pil = PILImage.open(fpath).convert("RGB")
+        img_np  = np.array(img_pil)
+
+        cx, cy = kh["cx"], kh["cy"]
+        point_coords = np.array([[cx, cy]], dtype=np.float32)
+        point_labels = np.array([1])  # 1 = foreground
+
+        try:
+            with torch.inference_mode(), torch.autocast(device, dtype=torch.bfloat16):
+                image_predictor.set_image(img_np)
+                masks, mask_scores, _ = image_predictor.predict(
+                    point_coords=point_coords,
+                    point_labels=point_labels,
+                    multimask_output=True,
+                    normalize_coords=True,
+                )
+
+            # Pick highest-scoring mask
+            best_idx = int(np.argmax(mask_scores))
+            mask     = masks[best_idx]  # (H, W) bool array
+
+            y_idx, x_idx = np.where(mask)
+            if len(x_idx) == 0:
+                # SAM found nothing — keep GDINO bbox
+                refined[fidx] = kh
+                continue
+
+            x1 = float(x_idx.min())
+            y1 = float(y_idx.min())
+            x2 = float(x_idx.max())
+            y2 = float(y_idx.max())
+            refined[fidx] = {
+                "x": x1, "y": y1,
+                "w": x2 - x1, "h": y2 - y1,
+                "cx": (x1 + x2) / 2.0,
+                "cy": (y1 + y2) / 2.0,
+                "score": kh["score"],
+            }
+        except Exception as e:
+            print(f"  SAM failed on frame {fidx}: {e} — keeping GDINO bbox")
+            refined[fidx] = kh
+
+    return refined
+
+
+# ─────────────────────────────────────────────────────────────
+# Build smooth keyhole trajectory from GDINO-detected positions
+# ─────────────────────────────────────────────────────────────
+def build_keyhole_trajectory(keyhole_raw, num_frames, config):
+    """
+    Convert sparse GDINO keyhole detections into a smooth, interpolated
+    trajectory spanning from first keyhole frame to end of video.
+
+    Steps:
+      1. Temporal outlier rejection (local median filter on cx)
+      2. Find first real keyhole frame (keyhole starts at right, moves left)
+      3. Linear interpolation across gaps
+      4. Constant extrapolation to end of video
+      5. Rolling-average smoothing
+
+    Returns:
+        (keyhole_positions, first_keyhole_frame)
+        keyhole_positions: {frame_idx: {"cx", "cy", "bbox"}}
+        first_keyhole_frame: int or None
+    """
+    if not keyhole_raw:
+        print("  WARNING: No keyhole detections found by GDINO.")
+        return {}, None
+
+    kh_traj = config.get("keyhole_trajectory", {})
+    max_jump         = kh_traj.get("max_jump_px", 120)
+    median_window    = kh_traj.get("median_window", 30)
+    smooth_window    = kh_traj.get("smoothing_window", 5)
+    first_frame_min_x = kh_traj.get("first_frame_min_x", 100)
+
+    print(f"  Raw keyhole candidates: {len(keyhole_raw)} frames")
+
+    # Temporal filter — reject cx outliers
+    filtered = _temporal_filter(keyhole_raw, max_jump, median_window)
+    print(f"  After temporal filter: {len(filtered)} frames")
+
+    # Find first real keyhole frame
+    first_kh = _find_first_keyhole_frame(filtered, first_frame_min_x)
+    if first_kh is None:
+        print("  WARNING: No reliable keyhole frame found after temporal filtering.")
+        return {}, None
+
+    # Drop frames before first keyhole
+    filtered = {f: c for f, c in filtered.items() if f >= first_kh}
+    last_kh = max(filtered.keys())
+    print(f"  Keyhole range: frames {first_kh} – {last_kh}")
+
+    # Interpolate gaps + extrapolate to end of video
+    positions = _interpolate_positions(filtered, first_kh, num_frames - 1)
+    print(f"  After interpolation: {len(positions)} frames")
+
+    # Smooth
+    positions = _smooth_positions(positions, smooth_window)
+
+    return dict(positions), first_kh
 
 
 # ─────────────────────────────────────────────────────────────
@@ -91,24 +313,24 @@ def run_detection(
 def classify_bubble_tracks(bubble_tracks, keyhole_positions, config):
     """
     For each bubble track, compute:
-      - average distance to keyhole center
-      - near/far classification
-      - transient/permanent classification
+      - average distance to keyhole center (metadata only)
+      - near/far classification (metadata only)
+      - transient/permanent classification (used for labels 3/4)
 
     Returns:
         List of track dicts with added classification metadata.
     """
-    prox_cfg = config["proximity"]
+    prox_cfg  = config["proximity"]
     track_cfg = config["track_classification"]
 
     near_threshold = prox_cfg["near_threshold_pixels"]
-    transient_max = track_cfg["transient_max_frames"]
-    permanent_min = track_cfg["permanent_min_frames"]
-    method = prox_cfg.get("method", "center_distance")
+    transient_max  = track_cfg["transient_max_frames"]
+    permanent_min  = track_cfg["permanent_min_frames"]
+    method         = prox_cfg.get("method", "center_distance")
 
     classified = []
     for track in bubble_tracks:
-        entries = track["entries"]
+        entries  = track["entries"]
         duration = len(entries)
 
         distances = []
@@ -118,65 +340,79 @@ def classify_bubble_tracks(bubble_tracks, keyhole_positions, config):
             bubble_cy = (box[1] + box[3]) / 2
 
             if fidx in keyhole_positions:
-                kh = keyhole_positions[fidx]
-                kh_cx = kh["cx"]
-                kh_cy = kh["cy"]
+                kh     = keyhole_positions[fidx]
+                kh_cx  = kh["cx"]
+                kh_cy  = kh["cy"]
                 kh_box = kh["bbox"]
                 if method == "edge_distance":
-                    dx = max(0, max(box[0] - kh_box[2], kh_box[0] - box[2]))
-                    dy = max(0, max(box[1] - kh_box[3], kh_box[1] - box[3]))
+                    dx   = max(0, max(box[0] - kh_box[2], kh_box[0] - box[2]))
+                    dy   = max(0, max(box[1] - kh_box[3], kh_box[1] - box[3]))
                     dist = np.sqrt(dx ** 2 + dy ** 2)
-                else:  # center_distance (default)
+                else:
                     dist = np.sqrt(
                         (bubble_cx - kh_cx) ** 2 + (bubble_cy - kh_cy) ** 2
                     )
                 distances.append(dist)
 
         avg_distance = float(np.mean(distances)) if distances else float("inf")
-        is_near = avg_distance <= near_threshold
+        is_near      = avg_distance <= near_threshold
         is_permanent = duration >= permanent_min
-        is_transient = duration < transient_max
+        is_transient = duration <  transient_max
 
         classified.append({
             **track,
-            "duration": duration,
+            "duration":                duration,
             "avg_distance_to_keyhole": round(avg_distance, 2),
-            "is_near_keyhole": is_near,
-            "is_permanent": is_permanent,
-            "is_transient": is_transient,
+            "is_near_keyhole":         is_near,
+            "is_permanent":            is_permanent,
+            "is_transient":            is_transient,
         })
 
     near_count = sum(1 for t in classified if t["is_near_keyhole"])
     perm_count = sum(1 for t in classified if t["is_permanent"])
     print(
-        f"Bubble tracks: {len(classified)} total, "
+        f"  Bubble tracks: {len(classified)} total, "
         f"{near_count} near keyhole, {perm_count} permanent"
     )
     return classified
 
 
 # ─────────────────────────────────────────────────────────────
-# Per-frame labeling
+# Per-frame labeling — corrected rules
 # ─────────────────────────────────────────────────────────────
 def label_frames(
-    num_frames, first_keyhole_frame, keyhole_positions,
-    classified_bubble_tracks, config,
+    num_frames, keyhole_positions,
+    classified_bubble_tracks,
 ):
     """
-    Assign a label to each frame using the updated rules:
+    Assign a label to each frame:
 
-      0 - No Signal:       No keyhole detected in the frame.
-      1 - Normal Process:  Entire trajectory has NO permanent pore anywhere
-                           → all keyhole frames are normal.
-      2 - Unstable:        Trajectory HAS permanent pores, but this specific
-                           frame has no pore.
-      3 - Transient Pore:  A pore exists at this frame that will disappear.
-      4 - Permanent Pore:  A pore exists at this frame that stays permanently.
+      0 - No Signal:
+            No keyhole detected at this frame.
 
-    The logic is:
-      1. First, determine globally whether ANY permanent pore track exists.
-      2. If none → all keyhole frames get label 1 (Normal Process).
-      3. If yes  → per-frame decision based on what pores are present.
+      1 - Normal Process:
+            Keyhole present, AND across ALL frames in the entire video
+            there are NO bubbles at all.
+
+      2 - Unstable Process without Pore Generation:
+            Keyhole present, no bubble at THIS frame, but bubbles DO
+            exist somewhere across all frames in the video.
+
+      3 - Transient Pore Generation:
+            At least one bubble at this frame will eventually disappear.
+            TRANSIENT TAKES PRIORITY: even if permanent bubbles also exist
+            at this frame, the presence of ANY transient bubble makes the
+            frame label 3.
+
+      4 - Permanent Pore Generation:
+            ALL bubbles at this frame are permanent (none are transient).
+
+    Priority hierarchy (highest wins):
+        0  (no keyhole)  is determined first,
+        1  (no bubbles globally) next,
+        2  (no bubbles here, but exist elsewhere) next,
+        3  (any transient bubble here) beats 4,
+        4  (only permanent bubbles here).
     """
     # Build per-frame bubble track lookup
     frame_tracks = defaultdict(list)
@@ -184,43 +420,36 @@ def label_frames(
         for entry in track["entries"]:
             frame_tracks[entry[0]].append(track)
 
-    # Global check: does ANY permanent pore exist in the entire trajectory?
-    has_any_permanent = any(t["is_permanent"] for t in classified_bubble_tracks)
+    # Global: does ANY bubble track exist in the entire video?
+    has_any_bubbles = len(classified_bubble_tracks) > 0
 
     frame_labels = {}
     for fidx in range(num_frames):
-        has_keyhole = fidx in keyhole_positions
-        tracks_here = frame_tracks.get(fidx, [])
-        has_pores = len(tracks_here) > 0
+        has_keyhole     = fidx in keyhole_positions
+        tracks_here     = frame_tracks.get(fidx, [])
+        has_bubbles_now = len(tracks_here) > 0
 
-        # Rule 0: No keyhole → No Signal
+        # ── Label 0: No keyhole ──────────────────────────────────
         if not has_keyhole:
             frame_labels[fidx] = 0
             continue
 
-        # Keyhole is present from here on
-
-        # Rule 1: No permanent pore in entire trajectory → Normal Process
-        if not has_any_permanent:
+        # ── Label 1: Keyhole + no bubbles anywhere in video ──────
+        if not has_any_bubbles:
             frame_labels[fidx] = 1
             continue
 
-        # Trajectory HAS permanent pores somewhere
-
-        # Rule 2: This frame has no pore → Unstable
-        if not has_pores:
+        # ── Label 2: Keyhole + no bubbles at this frame ──────────
+        if not has_bubbles_now:
             frame_labels[fidx] = 2
             continue
 
-        # This frame has pore(s) — classify by track type
-        has_permanent_here = any(t["is_permanent"] for t in tracks_here)
-
-        if has_permanent_here:
-            # Rule 4: Permanent pore at this frame
-            frame_labels[fidx] = 4
-        else:
-            # Rule 3: Transient pore at this frame
-            frame_labels[fidx] = 3
+        # ── Labels 3 / 4: per-bubble classification ──────────────
+        # Transient takes priority: if ANY bubble at this frame is
+        # transient (will disappear), label the frame as 3.
+        # Only label 4 when every bubble here is permanent.
+        has_transient_here = any(t["is_transient"] for t in tracks_here)
+        frame_labels[fidx] = 3 if has_transient_here else 4
 
     return frame_labels
 
@@ -228,25 +457,24 @@ def label_frames(
 # ─────────────────────────────────────────────────────────────
 # Label smoothing (majority vote)
 # ─────────────────────────────────────────────────────────────
-def smooth_labels(frame_labels, num_frames, config):
+def smooth_labels(frame_labels, config):
     """Apply majority-vote smoothing within a sliding window."""
     window = config["intervals"].get("smoothing_window", 1)
     if window <= 1:
         return frame_labels
 
-    sorted_frames = sorted(frame_labels.keys())
-    labels_array = [frame_labels[f] for f in sorted_frames]
-    smoothed = {}
+    sorted_frames  = sorted(frame_labels.keys())
+    labels_array   = [frame_labels[f] for f in sorted_frames]
+    smoothed       = {}
 
     for i, fidx in enumerate(sorted_frames):
         start = max(0, i - window // 2)
-        end = min(len(sorted_frames), i + window // 2 + 1)
+        end   = min(len(sorted_frames), i + window // 2 + 1)
         window_labels = labels_array[start:end]
-        counts = Counter(window_labels)
-        # On tie, keep current label
-        most_common = counts.most_common()
-        top_count = most_common[0][1]
-        candidates = [lbl for lbl, cnt in most_common if cnt == top_count]
+        counts        = Counter(window_labels)
+        most_common   = counts.most_common()
+        top_count     = most_common[0][1]
+        candidates    = [lbl for lbl, cnt in most_common if cnt == top_count]
         if labels_array[i] in candidates:
             smoothed[fidx] = labels_array[i]
         else:
@@ -265,38 +493,36 @@ def group_into_intervals(frame_labels, num_frames, config):
     Returns:
         List of {start_frame, end_frame, duration_frames, label_id, label_name}.
     """
-    labels_cfg = config["labels"]
+    labels_cfg    = config["labels"]
     label_name_map = {v["id"]: v["name"] for v in labels_cfg.values()}
 
-    intervals = []
-    current_label = None
-    current_start = None
+    intervals      = []
+    current_label  = None
+    current_start  = None
 
     for fidx in range(num_frames):
         label = frame_labels.get(fidx, 0)
         if label != current_label:
             if current_label is not None:
                 intervals.append({
-                    "start_frame": current_start,
-                    "end_frame": fidx - 1,
+                    "start_frame":    current_start,
+                    "end_frame":      fidx - 1,
                     "duration_frames": fidx - current_start,
-                    "label_id": current_label,
-                    "label_name": label_name_map.get(current_label, "Unknown"),
+                    "label_id":       current_label,
+                    "label_name":     label_name_map.get(current_label, "Unknown"),
                 })
             current_label = label
             current_start = fidx
 
-    # Final interval
     if current_label is not None:
         intervals.append({
-            "start_frame": current_start,
-            "end_frame": num_frames - 1,
+            "start_frame":    current_start,
+            "end_frame":      num_frames - 1,
             "duration_frames": num_frames - current_start,
-            "label_id": current_label,
-            "label_name": label_name_map.get(current_label, "Unknown"),
+            "label_id":       current_label,
+            "label_name":     label_name_map.get(current_label, "Unknown"),
         })
 
-    # Optionally merge short intervals into neighbors
     min_len = config["intervals"].get("min_interval_length", 1)
     if min_len > 1:
         intervals = _merge_short_intervals(intervals, min_len)
@@ -309,27 +535,22 @@ def _merge_short_intervals(intervals, min_length):
     if len(intervals) <= 1:
         return intervals
 
-    merged = list(intervals)
+    merged  = list(intervals)
     changed = True
     while changed:
-        changed = False
+        changed    = False
         new_merged = []
-        i = 0
+        i          = 0
         while i < len(merged):
             iv = merged[i]
             if iv["duration_frames"] < min_length and len(new_merged) > 0:
-                # Merge into previous interval
-                new_merged[-1]["end_frame"] = iv["end_frame"]
+                new_merged[-1]["end_frame"]      = iv["end_frame"]
                 new_merged[-1]["duration_frames"] = (
                     new_merged[-1]["end_frame"] - new_merged[-1]["start_frame"] + 1
                 )
                 changed = True
-            elif (
-                iv["duration_frames"] < min_length
-                and i + 1 < len(merged)
-            ):
-                # Merge into next interval
-                merged[i + 1]["start_frame"] = iv["start_frame"]
+            elif iv["duration_frames"] < min_length and i + 1 < len(merged):
+                merged[i + 1]["start_frame"]     = iv["start_frame"]
                 merged[i + 1]["duration_frames"] = (
                     merged[i + 1]["end_frame"] - iv["start_frame"] + 1
                 )
@@ -350,13 +571,13 @@ def generate_labeled_frames(
     keyhole_positions, classified_bubble_tracks, config,
 ):
     """
-    Save annotated frames with a colored label bar, keyhole box, and
-    bubble boxes drawn on each frame.
+    Save annotated frames with a colored label bar, keyhole box (white),
+    and per-track bubble boxes (color-coded by permanence).
     """
     os.makedirs(output_dir, exist_ok=True)
-    labels_cfg = config["labels"]
-    label_name_map = {v["id"]: v["name"] for v in labels_cfg.values()}
-    label_color_map = {v["id"]: tuple(v["color"]) for v in labels_cfg.values()}
+    labels_cfg     = config["labels"]
+    label_name_map  = {v["id"]: v["name"]          for v in labels_cfg.values()}
+    label_color_map = {v["id"]: tuple(v["color"])   for v in labels_cfg.values()}
 
     # Build per-frame bubble box lookup
     frame_bubble_boxes = defaultdict(list)
@@ -367,18 +588,18 @@ def generate_labeled_frames(
 
     for fidx in tqdm(range(len(frame_names)), desc="Saving labeled frames"):
         fpath = os.path.join(source_dir, frame_names[fidx])
-        img = cv2.imread(fpath)
+        img   = cv2.imread(fpath)
         if img is None:
             continue
 
-        label_id = frame_labels.get(fidx, 0)
+        label_id   = frame_labels.get(fidx, 0)
         label_name = label_name_map.get(label_id, "Unknown")
-        color_rgb = label_color_map.get(label_id, (128, 128, 128))
-        color_bgr = (color_rgb[2], color_rgb[1], color_rgb[0])
+        color_rgb  = label_color_map.get(label_id, (128, 128, 128))
+        color_bgr  = (color_rgb[2], color_rgb[1], color_rgb[0])
 
-        h, w = img.shape[:2]
+        w = img.shape[1]
 
-        # Draw colored label bar at top
+        # Colored label bar at top
         bar_h = 30
         cv2.rectangle(img, (0, 0), (w, bar_h), color_bgr, -1)
         cv2.putText(
@@ -386,36 +607,56 @@ def generate_labeled_frames(
             (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1,
         )
 
-        # Draw keyhole box (white)
+        # Keyhole box (white)
         if fidx in keyhole_positions:
-            kh = keyhole_positions[fidx]
+            kh     = keyhole_positions[fidx]
             kh_box = kh["bbox"]
-            pt1 = (int(kh_box[0]), int(kh_box[1]))
-            pt2 = (int(kh_box[2]), int(kh_box[3]))
+            pt1    = (int(kh_box[0]), int(kh_box[1]))
+            pt2    = (int(kh_box[2]), int(kh_box[3]))
             cv2.rectangle(img, pt1, pt2, (255, 255, 255), 2)
             cv2.putText(
-                img, "keyhole", (pt1[0], pt1[1] - 4),
+                img, "keyhole", (pt1[0], max(pt1[1] - 4, bar_h + 4)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1,
             )
 
-        # Draw bubble boxes
+        # Bubble boxes — red=permanent, orange=transient, cyan=far-from-keyhole
         for box, track in frame_bubble_boxes.get(fidx, []):
-            if track["is_near_keyhole"]:
-                bb_color = (0, 0, 255) if track["is_permanent"] else (0, 165, 255)
+            if track["is_permanent"]:
+                bb_color = (0, 0, 255)       # red
+            elif track["is_near_keyhole"]:
+                bb_color = (0, 165, 255)     # orange
             else:
-                bb_color = (0, 255, 255)
+                bb_color = (0, 255, 255)     # cyan
             pt1 = (int(box[0]), int(box[1]))
             pt2 = (int(box[2]), int(box[3]))
             cv2.rectangle(img, pt1, pt2, bb_color, 1)
-            lbl = f"T{track['id']}"
             cv2.putText(
-                img, lbl, (pt1[0], pt1[1] - 4),
+                img, f"T{track['id']}", (pt1[0], max(pt1[1] - 4, bar_h + 4)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.3, bb_color, 1,
             )
 
         cv2.imwrite(os.path.join(output_dir, f"{fidx:05d}.jpg"), img)
 
     print(f"Labeled frames saved to {output_dir}")
+
+
+# ─────────────────────────────────────────────────────────────
+# Detection cache helpers
+# ─────────────────────────────────────────────────────────────
+def save_detection_cache(all_detections, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    serialisable = {
+        str(k): (v[0], v[1], v[2]) for k, v in all_detections.items()
+    }
+    with open(path, "w") as f:
+        json.dump(serialisable, f)
+    print(f"Detection cache saved to {path}")
+
+
+def load_detection_cache(path):
+    with open(path, "r") as f:
+        raw = json.load(f)
+    return {int(k): (v[0], v[1], v[2]) for k, v in raw.items()}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -427,11 +668,15 @@ def main():
     )
     parser.add_argument(
         "--config", type=str, default="labeling_rules.yaml",
-        help="Path to labeling rules YAML config (default: labeling_rules.yaml)",
+        help="Labeling rules YAML (default: labeling_rules.yaml)",
     )
     parser.add_argument(
         "--skip-extraction", action="store_true",
         help="Skip frame extraction (reuse already-extracted frames)",
+    )
+    parser.add_argument(
+        "--skip-detection", action="store_true",
+        help="Skip GDINO detection and reuse cached raw_detections.json",
     )
     parser.add_argument(
         "--output", type=str, default=OUTPUT_JSON_PATH,
@@ -439,28 +684,29 @@ def main():
     )
     args = parser.parse_args()
 
-    # ── Load config ──
+    # ── Load config ──────────────────────────────────────────────
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
-    print(f"Loaded labeling config from {args.config}")
+    print(f"Loaded config from {args.config}")
 
-    # ── Load models ──
-    gdino_processor, gdino_model, image_predictor, device = load_models(
-        GDINO_MODEL_ID, SAM2_CHECKPOINT, SAM2_MODEL_CFG,
-    )
+    # ── Load models (not needed if skipping detection) ──────────
+    if not args.skip_detection:
+        gdino_processor, gdino_model, image_predictor, device = load_models(
+            GDINO_MODEL_ID, SAM2_CHECKPOINT, SAM2_MODEL_CFG,
+        )
+    else:
+        gdino_processor = gdino_model = image_predictor = device = None
 
-    # ── Extract frames ──
+    # ── Extract / reuse frames ───────────────────────────────────
     if args.skip_extraction:
         from PIL import Image as PILImage
 
-        frame_names = [
-            p for p in os.listdir(SOURCE_VIDEO_FRAME_DIR)
-            if os.path.splitext(p)[-1].lower() in [".jpg", ".jpeg"]
-        ]
-        frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
-        sample = PILImage.open(
-            os.path.join(SOURCE_VIDEO_FRAME_DIR, frame_names[0])
+        frame_names = sorted(
+            [p for p in os.listdir(SOURCE_VIDEO_FRAME_DIR)
+             if os.path.splitext(p)[-1].lower() in (".jpg", ".jpeg")],
+            key=lambda p: int(os.path.splitext(p)[0]),
         )
+        sample  = PILImage.open(os.path.join(SOURCE_VIDEO_FRAME_DIR, frame_names[0]))
         img_w, img_h = sample.size
         print(f"Reusing {len(frame_names)} frames from {SOURCE_VIDEO_FRAME_DIR}")
     else:
@@ -471,69 +717,93 @@ def main():
     num_frames = len(frame_names)
     print(f"Total frames: {num_frames}, image size: {img_w}x{img_h}")
 
-    # ── Keyhole detection (classical CV) ──
-    print("\n--- Detecting keyhole (classical CV) ---")
-    keyhole_positions, first_keyhole_frame = detect_keyhole_all_frames(
-        SOURCE_VIDEO_FRAME_DIR, frame_names, config,
-    )
-    kh_method = "classical_cv"
+    # ── GDINO detection ──────────────────────────────────────────
+    print("\n--- Running GDINO detection ---")
+    if args.skip_detection:
+        print(f"  Loading from cache: {DETECTION_CACHE_PATH}")
+        all_detections = load_detection_cache(DETECTION_CACHE_PATH)
+    else:
+        all_detections = run_all_detections(
+            frame_names, SOURCE_VIDEO_FRAME_DIR, config,
+            gdino_processor, gdino_model, img_h, img_w, device,
+        )
+        save_detection_cache(all_detections, DETECTION_CACHE_PATH)
 
-    # ── Bubble detection (Grounding DINO) ──
-    print("\n--- Running bubble detection ---")
-    all_detections = run_detection(
-        frame_names, SOURCE_VIDEO_FRAME_DIR, config,
-        gdino_processor, gdino_model, img_h, img_w, device,
+    # ── Split detections: keyhole vs bubbles ─────────────────────
+    print("\n--- Splitting detections by shape ---")
+    keyhole_raw, bubble_detections = split_keyhole_and_bubbles(
+        all_detections, config, img_h, img_w,
     )
 
-    # ── Build bubble tracks ──
+    # ── Optional: SAM point-prompt refinement of keyhole positions ─
+    if config["detection"]["keyhole"].get("use_sam_refinement", False):
+        print("\n--- Refining keyhole positions with SAM2 ---")
+        if image_predictor is None:
+            print("  WARNING: image_predictor not loaded (--skip-detection was set). "
+                  "Re-run without --skip-detection to use SAM refinement.")
+        else:
+            keyhole_raw = refine_keyhole_with_sam(
+                keyhole_raw, frame_names, SOURCE_VIDEO_FRAME_DIR,
+                image_predictor, device,
+            )
+
+    # ── Build keyhole trajectory ──────────────────────────────────
+    print("\n--- Building keyhole trajectory ---")
+    keyhole_positions, first_keyhole_frame = build_keyhole_trajectory(
+        keyhole_raw, num_frames, config,
+    )
+
+    if first_keyhole_frame is None:
+        print("  WARNING: No keyhole detected — all frames will be labeled 0.")
+
+    # ── Build bubble tracks ───────────────────────────────────────
     print("\n--- Building bubble tracks ---")
-    track_cfg = config["tracking"]
-    frames_list = list(range(num_frames))
+    track_cfg    = config["tracking"]
+    frames_list  = list(range(num_frames))
 
-    bubble_tracks, bb_per_frame = build_and_filter_tracks(
-        all_detections, frames_list,
-        track_iou_threshold=track_cfg["track_iou_threshold"],
-        max_track_gap=track_cfg["max_track_gap"],
-        min_track_length=track_cfg["bubble_min_track_length"],
+    bubble_tracks, _ = build_and_filter_tracks(
+        bubble_detections, frames_list,
+        track_iou_threshold = track_cfg["track_iou_threshold"],
+        max_track_gap       = track_cfg["max_track_gap"],
+        min_track_length    = track_cfg["bubble_min_track_length"],
     )
-    print(f"Bubble tracks: {len(bubble_tracks)}")
+    print(f"  Bubble tracks after filtering: {len(bubble_tracks)}")
 
-    # ── Classify bubble tracks ──
+    # ── Classify bubble tracks ────────────────────────────────────
     print("\n--- Classifying bubble tracks ---")
     classified_tracks = classify_bubble_tracks(
         bubble_tracks, keyhole_positions, config,
     )
 
-    # ── Label frames ──
+    # ── Label frames ──────────────────────────────────────────────
     print("\n--- Labeling frames ---")
     frame_labels = label_frames(
-        num_frames, first_keyhole_frame, keyhole_positions,
-        classified_tracks, config,
+        num_frames, keyhole_positions, classified_tracks,
     )
 
-    # ── Smooth labels ──
-    frame_labels = smooth_labels(frame_labels, num_frames, config)
+    # ── Smooth labels ─────────────────────────────────────────────
+    frame_labels = smooth_labels(frame_labels, config)
 
-    # ── Group into intervals ──
+    # ── Group into intervals ──────────────────────────────────────
     intervals = group_into_intervals(frame_labels, num_frames, config)
 
-    # ── Print summary ──
-    labels_cfg = config["labels"]
-    label_name_map = {v["id"]: v["name"] for v in labels_cfg.values()}
-    count_by_label = Counter(frame_labels.values())
+    # ── Print summary ─────────────────────────────────────────────
+    labels_cfg     = config["labels"]
+    label_name_map  = {v["id"]: v["name"] for v in labels_cfg.values()}
+    count_by_label  = Counter(frame_labels.values())
 
     print("\n" + "=" * 60)
     print("LABELING SUMMARY")
     print("=" * 60)
-    print(f"First keyhole frame: {first_keyhole_frame}")
-    print(f"Keyhole detection method: {kh_method}")
-    print(f"Total frames: {num_frames}")
-    print(f"Total intervals: {len(intervals)}")
+    print(f"First keyhole frame:    {first_keyhole_frame}")
+    print(f"Keyhole detection:      GDINO (bubble.pore, shape split)")
+    print(f"Total frames:           {num_frames}")
+    print(f"Total intervals:        {len(intervals)}")
     print()
     for label_id in sorted(count_by_label.keys()):
-        name = label_name_map.get(label_id, "Unknown")
+        name  = label_name_map.get(label_id, "Unknown")
         count = count_by_label[label_id]
-        pct = 100.0 * count / num_frames
+        pct   = 100.0 * count / num_frames
         print(f"  [{label_id}] {name}: {count} frames ({pct:.1f}%)")
     print()
     print("Intervals:")
@@ -544,14 +814,14 @@ def main():
             f"[{iv['label_id']}] {iv['label_name']}"
         )
 
-    # ── Generate labeled frames ──
+    # ── Generate labeled frames ───────────────────────────────────
     print("\n--- Generating labeled frames ---")
     generate_labeled_frames(
         frame_names, SOURCE_VIDEO_FRAME_DIR, OUTPUT_FRAMES_DIR,
         frame_labels, keyhole_positions, classified_tracks, config,
     )
 
-    # ── Build per-frame detail for output ──
+    # ── Build output JSON ─────────────────────────────────────────
     frame_track_lookup = defaultdict(list)
     for track in classified_tracks:
         for entry in track["entries"]:
@@ -559,20 +829,20 @@ def main():
 
     frame_label_details = []
     for fidx in range(num_frames):
-        label_id = frame_labels.get(fidx, 0)
+        label_id   = frame_labels.get(fidx, 0)
         tracks_here = frame_track_lookup.get(fidx, [])
         detail = {
-            "frame_index": fidx,
-            "frame_file": frame_names[fidx] if fidx < len(frame_names) else None,
-            "label_id": label_id,
-            "label_name": label_name_map.get(label_id, "Unknown"),
+            "frame_index":   fidx,
+            "frame_file":    frame_names[fidx] if fidx < len(frame_names) else None,
+            "label_id":      label_id,
+            "label_name":    label_name_map.get(label_id, "Unknown"),
             "keyhole_present": fidx in keyhole_positions,
-            "num_bubbles": len(tracks_here),
+            "num_bubbles":   len(tracks_here),
             "bubble_details": [
                 {
-                    "track_id": t["id"],
-                    "near_keyhole": t["is_near_keyhole"],
-                    "permanent": t["is_permanent"],
+                    "track_id":            t["id"],
+                    "near_keyhole":        t["is_near_keyhole"],
+                    "permanent":           t["is_permanent"],
                     "distance_to_keyhole": t["avg_distance_to_keyhole"],
                 }
                 for t in tracks_here
@@ -583,14 +853,13 @@ def main():
             detail["keyhole_center"] = [round(kh["cx"], 2), round(kh["cy"], 2)]
         frame_label_details.append(detail)
 
-    # ── Build output JSON ──
     output = {
-        "video_path": VIDEO_PATH,
-        "config_file": args.config,
-        "keyhole_detection_method": kh_method,
-        "first_keyhole_frame": first_keyhole_frame,
-        "image_size": {"width": img_w, "height": img_h},
-        "total_frames": num_frames,
+        "video_path":               VIDEO_PATH,
+        "config_file":              args.config,
+        "keyhole_detection_method": "gdino_shape_split",
+        "first_keyhole_frame":      first_keyhole_frame,
+        "image_size":               {"width": img_w, "height": img_h},
+        "total_frames":             num_frames,
         "label_definitions": {
             k: {"id": v["id"], "name": v["name"], "description": v["description"]}
             for k, v in labels_cfg.items()
@@ -599,17 +868,17 @@ def main():
             label_name_map.get(lid, "Unknown"): count_by_label.get(lid, 0)
             for lid in range(5)
         },
-        "intervals": intervals,
+        "intervals":  intervals,
         "tracks": {
             "bubble_tracks": [
                 {
-                    "track_id": t["id"],
-                    "duration": t["duration"],
-                    "is_near_keyhole": t["is_near_keyhole"],
-                    "is_permanent": t["is_permanent"],
-                    "avg_distance_to_keyhole": t["avg_distance_to_keyhole"],
-                    "first_frame": t["entries"][0][0],
-                    "last_frame": t["entries"][-1][0],
+                    "track_id":                 t["id"],
+                    "duration":                 t["duration"],
+                    "is_near_keyhole":          t["is_near_keyhole"],
+                    "is_permanent":             t["is_permanent"],
+                    "avg_distance_to_keyhole":  t["avg_distance_to_keyhole"],
+                    "first_frame":              t["entries"][0][0],
+                    "last_frame":               t["entries"][-1][0],
                 }
                 for t in classified_tracks
             ],
@@ -617,7 +886,6 @@ def main():
         "frame_labels": frame_label_details,
     }
 
-    # ── Save ──
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     with open(args.output, "w") as f:
         json.dump(output, f, indent=2)

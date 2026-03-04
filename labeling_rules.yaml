@@ -13,12 +13,15 @@ detection:
     max_box_area_ratio: 0.03
 
   keyhole:
-    # Shape criteria for splitting keyhole from bubble detections.
-    # Detections with AR >= min_aspect_ratio AND height >= min_height are keyhole.
-    min_aspect_ratio: 1.5
-    min_height: 80
-    box_threshold: 0.15          # lower threshold to catch more keyholes
+    # Among all GDINO detections in a frame, the leftmost one whose height
+    # >= min_height is treated as the keyhole candidate. Everything else
+    # is classified as a bubble.
+    min_height: 50               # minimum px height to be a keyhole candidate
+    box_threshold: 0.15          # lower threshold so dim keyholes are not missed
     max_box_area_ratio: 0.10     # keyholes can be larger than bubbles
+    # If true, use SAM2 point-prompt segmentation to refine the keyhole bbox
+    # after the leftmost-detection step.  More accurate but slower (~+5 min).
+    use_sam_refinement: true
 
 # --- Keyhole Trajectory Post-Processing ---
 # After GDINO detects sparse keyhole positions, the trajectory is cleaned up:
@@ -75,13 +78,18 @@ labels:
   transient_pore:
     id: 3
     name: "Transient Pore Generation"
-    description: "A bubble at this frame that will eventually disappear (transient track)"
+    description: >
+      At least one bubble at this frame will disappear later (transient track).
+      PRIORITY: transient beats permanent — even if permanent bubbles also exist
+      at this frame, the presence of any transient bubble gives label 3.
     color: [255, 165, 0]     # orange
 
   permanent_pore:
     id: 4
     name: "Permanent Pore Generation"
-    description: "A bubble at this frame that stays permanently (permanent track)"
+    description: >
+      All bubbles at this frame are permanent (none will disappear).
+      Only assigned when no transient bubbles are present at this frame.
     color: [255, 0, 0]       # red
 
 # --- Interval Grouping ---

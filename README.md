@@ -93,7 +93,6 @@ Grounded-SAM-pipeline/
 ├── labeling_rules.yaml             # Configurable rules for the labeling pipeline
 ├── evaluate.py                     # Evaluation against labelme ground truth
 ├── tune_params.py                  # Automatic hyperparameter grid search
-├── test_keyhole_prompts.py         # Utility to test GDINO prompts for keyhole detection
 ├── setup.py                        # SAM 2 package setup
 ├── pyproject.toml                  # Build system config
 ├── checkpoints/
@@ -103,7 +102,7 @@ Grounded-SAM-pipeline/
 ├── utils/
 │   ├── video_utils.py              # Video creation utility
 │   ├── detection_utils.py          # Shared detection & tracking functions
-│   └── keyhole_detector.py         # Classical-CV keyhole detector
+│   └── keyhole_detector.py         # Keyhole trajectory utilities (temporal filter, interpolation, smoothing)
 └── data/                           # Data directory (not tracked)
     ├── raw/                        # Input videos
     ├── frames/custom_video_frames/ # Extracted & cropped frames
@@ -275,26 +274,51 @@ A separate pipeline that classifies each video frame into one of 5 process state
 
 | ID | Label | Description |
 |----|-------|-------------|
-| 0 | No Signal | No keyhole detected in the frame |
-| 1 | Normal Process | Entire trajectory has no permanent pore |
-| 2 | Unstable Process without Pore Generation | Trajectory has permanent pores, but none at this frame |
-| 3 | Transient Pore Generation | A pore at this frame that will disappear |
-| 4 | Permanent Pore Generation | A pore at this frame that stays permanently |
+| 0 | No Signal | No keyhole detected at this frame |
+| 1 | Normal Process | Keyhole present; **no bubbles exist anywhere** in the entire video |
+| 2 | Unstable Process without Pore Generation | Keyhole present; no bubble at this frame, but bubbles exist elsewhere in the video |
+| 3 | Transient Pore Generation | At least one bubble at this frame **will disappear** later |
+| 4 | Permanent Pore Generation | All bubbles at this frame are permanent (none will disappear) |
+
+#### Labeling priority hierarchy
+
+Labels are assigned in the following order of precedence (first matching rule wins):
+
+```
+0  No keyhole detected
+↓
+1  Keyhole present, zero bubbles in entire video
+↓
+2  Keyhole present, no bubbles at this frame (but exist elsewhere)
+↓
+3  Any bubble at this frame is transient  ← transient beats permanent
+↓
+4  All bubbles at this frame are permanent
+```
+
+> **Transient takes priority over permanent (label 3 > label 4).**
+> If a frame contains both a transient bubble and a permanent bubble,
+> it is labeled 3 — because a new transient pore generation event is occurring.
 
 ### How it works
 
-1. **Keyhole detection (classical CV)** — Local background subtraction finds the keyhole as a dark vertical feature extending from the top of the image. Temporal filtering and interpolation produce a smooth keyhole trajectory across all frames. No GDINO prompt needed.
-2. **Bubble detection (Grounding DINO)** — Standard `"bubble.pore"` prompt detects all bubbles.
-3. **Track building** — IoU-based tracking links bubble detections into tracks.
-4. **Classification** — Each bubble track is classified by proximity to the keyhole (near/far) and persistence (transient/permanent).
-5. **Per-frame labeling** — A decision tree assigns one of 5 labels to each frame, then majority-vote smoothing reduces label flickering.
-6. **Output** — JSON results with per-frame labels, time intervals, and track metadata, plus annotated frame images.
+1. **GDINO detection** — Runs Grounding DINO once per frame with the `"bubble.pore"` prompt using a broad threshold to capture both bubbles and the keyhole in a single pass.
+2. **Keyhole split (leftmost heuristic)** — Among all detections in a frame, the leftmost box with height ≥ `min_height` is the keyhole candidate. The keyhole sits at the leading edge of the weld pool and moves right→left over time, so it is always the leftmost active feature.
+3. **Optional SAM2 refinement** — If `use_sam_refinement: true`, SAM2's point-prompt segmentation is run on each keyhole candidate using its center coordinate, producing a more precise bounding box.
+4. **Keyhole trajectory** — Temporal outlier rejection (local median filter on cx) → find first real keyhole frame → linear interpolation of gaps → rolling-average smoothing.
+5. **Bubble tracks** — IoU-based tracking builds per-bubble tracks across all frames.
+6. **Track classification** — Each bubble track is tagged as transient (`duration < transient_max_frames`) or permanent (`duration ≥ permanent_min_frames`), and near/far relative to the keyhole center.
+7. **Per-frame labeling** — The priority hierarchy above assigns one of 5 labels to each frame.
+8. **Smoothing & output** — Majority-vote smoothing reduces flickering; results are grouped into labeled time intervals and saved.
 
 ### Running
 
 ```bash
 # If frames are already extracted (from the detection pipeline):
 python labeling_pipeline.py --skip-extraction
+
+# Skip GDINO detection too (reuse cached raw_detections.json):
+python labeling_pipeline.py --skip-extraction --skip-detection
 
 # Full run (extracts frames from video first):
 python labeling_pipeline.py
@@ -303,23 +327,34 @@ python labeling_pipeline.py
 python labeling_pipeline.py --config my_rules.yaml --skip-extraction
 ```
 
-### Configuration
+### Configuration (`labeling_rules.yaml`)
 
-All labeling parameters are in `labeling_rules.yaml`. Key sections:
+| Section | Key parameters |
+|---------|---------------|
+| `detection.bubble` | `text_prompt`, `box_threshold`, `max_box_area_ratio` |
+| `detection.keyhole` | `min_height`, `box_threshold`, `max_box_area_ratio`, `use_sam_refinement` |
+| `keyhole_trajectory` | `max_jump_px`, `median_window`, `smoothing_window`, `first_frame_min_x` |
+| `tracking` | `track_iou_threshold`, `max_track_gap`, `bubble_min_track_length` |
+| `track_classification` | `transient_max_frames`, `permanent_min_frames` |
+| `proximity` | `method`, `near_threshold_pixels` |
+| `labels` | Label names, IDs, colors, descriptions |
+| `intervals` | `smoothing_window`, `min_interval_length` |
 
-- **`keyhole_cv`** — CV-based keyhole detection (Gaussian sigma, thresholds, temporal filtering)
-- **`detection.bubble`** — Grounding DINO prompt and thresholds
-- **`proximity`** — Distance threshold for near/far keyhole classification
-- **`track_classification`** — Frame count thresholds for transient/permanent
-- **`labels`** — Label names, IDs, colors, descriptions
-- **`intervals`** — Smoothing window, minimum interval length
+**To enable SAM2 keyhole refinement**, set in `labeling_rules.yaml`:
+```yaml
+detection:
+  keyhole:
+    use_sam_refinement: true
+```
+This passes the approximate keyhole center to SAM2 as a point prompt and replaces the GDINO bounding box with the SAM-derived one. More accurate but adds ~5 minutes to the run.
 
 ### Output
 
 | File | Description |
 |------|-------------|
-| `data/labeling/labeling_results.json` | Per-frame labels, intervals, bubble track metadata, keyhole positions |
-| `data/labeling/frames/*.jpg` | Annotated frames with colored label bar, keyhole box (white), bubble boxes (red/orange/cyan) |
+| `data/labeling/labeling_results.json` | Per-frame labels, time intervals, bubble track metadata, keyhole positions |
+| `data/labeling/raw_detections.json` | Cached raw GDINO detections (reused with `--skip-detection`) |
+| `data/labeling/frames/*.jpg` | Annotated frames: colored label bar at top, white keyhole box, bubble boxes (red = permanent, orange = transient near keyhole, cyan = far) |
 
 ---
 
