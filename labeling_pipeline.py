@@ -29,6 +29,7 @@ import os
 import json
 import yaml
 import argparse
+import re
 import cv2
 import numpy as np
 
@@ -57,6 +58,7 @@ OUTPUT_JSON_PATH = "./data/labeling/labeling_results.json"
 OUTPUT_FRAMES_DIR = "./data/labeling/frames"
 DETECTION_CACHE_PATH = "./data/labeling/raw_detections.json"
 CROP_TOP = 800 - 310  # keep bottom 310 rows
+FRAME_EXTS = (".jpg", ".jpeg", ".png", ".tif", ".tiff")
 
 GDINO_MODEL_ID = "IDEA-Research/grounding-dino-base"
 SAM2_CHECKPOINT = "./checkpoints/sam2.1_hiera_large.pt"
@@ -791,6 +793,26 @@ def load_detection_cache(path):
     return {int(k): (v[0], v[1], v[2]) for k, v in raw.items()}
 
 
+def list_frame_files(source_dir):
+    frame_names = [
+        p for p in os.listdir(source_dir)
+        if os.path.splitext(p)[-1].lower() in FRAME_EXTS
+    ]
+
+    def _sort_key(name):
+        stem = os.path.splitext(name)[0]
+        try:
+            return (0, int(stem))
+        except ValueError:
+            nums = re.findall(r"\d+", stem)
+            if nums:
+                return (1, int(nums[-1]), stem)
+            return (2, stem)
+
+    frame_names.sort(key=_sort_key)
+    return frame_names
+
+
 # ─────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────
@@ -803,6 +825,14 @@ def main():
         help="Labeling rules YAML (default: labeling_rules.yaml)",
     )
     parser.add_argument(
+        "--video-path", type=str, default=VIDEO_PATH,
+        help=f"Input video path (default: {VIDEO_PATH})",
+    )
+    parser.add_argument(
+        "--frames-dir", type=str, default=SOURCE_VIDEO_FRAME_DIR,
+        help=f"Frames directory (default: {SOURCE_VIDEO_FRAME_DIR})",
+    )
+    parser.add_argument(
         "--skip-extraction", action="store_true",
         help="Skip frame extraction (reuse already-extracted frames)",
     )
@@ -811,10 +841,23 @@ def main():
         help="Skip GDINO detection and reuse cached raw_detections.json",
     )
     parser.add_argument(
+        "--detection-cache", type=str, default=DETECTION_CACHE_PATH,
+        help=f"Detection cache path (default: {DETECTION_CACHE_PATH})",
+    )
+    parser.add_argument(
         "--output", type=str, default=OUTPUT_JSON_PATH,
         help=f"Output JSON path (default: {OUTPUT_JSON_PATH})",
     )
+    parser.add_argument(
+        "--output-frames-dir", type=str, default=OUTPUT_FRAMES_DIR,
+        help=f"Output frames directory (default: {OUTPUT_FRAMES_DIR})",
+    )
     args = parser.parse_args()
+
+    video_path = args.video_path
+    frames_dir = args.frames_dir
+    detection_cache_path = args.detection_cache
+    output_frames_dir = args.output_frames_dir
 
     # ── Load config ──────────────────────────────────────────────
     with open(args.config, "r") as f:
@@ -833,17 +876,17 @@ def main():
     if args.skip_extraction:
         from PIL import Image as PILImage
 
-        frame_names = sorted(
-            [p for p in os.listdir(SOURCE_VIDEO_FRAME_DIR)
-             if os.path.splitext(p)[-1].lower() in (".jpg", ".jpeg")],
-            key=lambda p: int(os.path.splitext(p)[0]),
-        )
-        sample  = PILImage.open(os.path.join(SOURCE_VIDEO_FRAME_DIR, frame_names[0]))
+        frame_names = list_frame_files(frames_dir)
+        if not frame_names:
+            raise FileNotFoundError(
+                f"No frames found in {frames_dir}. Expected files with extensions: {FRAME_EXTS}"
+            )
+        sample  = PILImage.open(os.path.join(frames_dir, frame_names[0]))
         img_w, img_h = sample.size
-        print(f"Reusing {len(frame_names)} frames from {SOURCE_VIDEO_FRAME_DIR}")
+        print(f"Reusing {len(frame_names)} frames from {frames_dir}")
     else:
         frame_names, img_w, img_h = extract_and_crop_frames(
-            VIDEO_PATH, SOURCE_VIDEO_FRAME_DIR, crop_top=CROP_TOP,
+            video_path, frames_dir, crop_top=CROP_TOP,
         )
 
     num_frames = len(frame_names)
@@ -852,14 +895,14 @@ def main():
     # ── GDINO detection ──────────────────────────────────────────
     print("\n--- Running GDINO detection ---")
     if args.skip_detection:
-        print(f"  Loading from cache: {DETECTION_CACHE_PATH}")
-        all_detections = load_detection_cache(DETECTION_CACHE_PATH)
+        print(f"  Loading from cache: {detection_cache_path}")
+        all_detections = load_detection_cache(detection_cache_path)
     else:
         all_detections = run_all_detections(
-            frame_names, SOURCE_VIDEO_FRAME_DIR, config,
+            frame_names, frames_dir, config,
             gdino_processor, gdino_model, img_h, img_w, device,
         )
-        save_detection_cache(all_detections, DETECTION_CACHE_PATH)
+        save_detection_cache(all_detections, detection_cache_path)
 
     # ── Split detections: keyhole vs bubbles ─────────────────────
     print("\n--- Splitting detections by shape ---")
@@ -875,7 +918,7 @@ def main():
                   "Re-run without --skip-detection to use SAM refinement.")
         else:
             keyhole_raw = refine_keyhole_with_sam(
-                keyhole_raw, frame_names, SOURCE_VIDEO_FRAME_DIR,
+                keyhole_raw, frame_names, frames_dir,
                 image_predictor, device, config,
             )
 
@@ -953,7 +996,7 @@ def main():
     # ── Generate labeled frames ───────────────────────────────────
     print("\n--- Generating labeled frames ---")
     generate_labeled_frames(
-        frame_names, SOURCE_VIDEO_FRAME_DIR, OUTPUT_FRAMES_DIR,
+        frame_names, frames_dir, output_frames_dir,
         frame_labels, keyhole_positions, classified_tracks, config,
     )
 
@@ -990,7 +1033,7 @@ def main():
         frame_label_details.append(detail)
 
     output = {
-        "video_path":               VIDEO_PATH,
+        "video_path":               video_path,
         "config_file":              args.config,
         "keyhole_detection_method": "gdino_shape_split",
         "first_keyhole_frame":      first_keyhole_frame,
