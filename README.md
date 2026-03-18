@@ -119,6 +119,41 @@ Grounded-SAM-pipeline/
 
 ---
 
+## Labeling Pipeline Notes
+
+- Frames are cropped to the bottom 310 pixels by default (`--crop-bottom-height`).
+- TIFF frames are normalized to 8-bit for clearer visibility (best with `tifffile` installed).
+- Bubbles detected before the first keyhole are ignored for labeling.
+- The trajectory ends when the keyhole stops moving right-to-left.
+  Configuration lives in `labeling_rules.yaml` under `keyhole_trajectory`:
+  `stop_min_leftward_px`, `stop_still_window`, and `stop_left_edge_x`.
+- Keyhole selection now prefers a temporally consistent track (right-to-left,
+  near the top) with optional constant-velocity filtering, and falls back to
+  the original shape-based split if needed.
+- For small-keyhole trajectories, detection uses a configurable low-threshold
+  rescue floor (`detection.keyhole.rescue_box_threshold`) and hybrid track
+  rescue when shape-based keyhole is missing.
+- Shape split also supports a relaxed tiny-keyhole pass (configurable under
+  `keyhole_selection`) when strict tall/skinny constraints miss.
+- Overlapping keyhole/bubble detections are de-duplicated using IoU/center
+  gating so the same object is not counted as both.
+- Bubbles left of the keyhole can be excluded via `bubble_validity`
+  (`require_right_of_keyhole`, `min_dx_from_keyhole_px`).
+  The rule can be limited to reliably observed keyhole frames to avoid
+  suppressing bubbles when keyhole tracking is uncertain.
+- Keyhole continuity recovery (template + motion prior) can be enabled in
+  `keyhole_recovery` to handle temporary tracking loss.
+- Keyhole trajectory extrapolation supports `linear` mode to continue motion
+  when detector boxes briefly disappear.
+- Linear extrapolation keeps keyhole box size stable to prevent oversized
+  runaway keyhole boxes.
+- Trajectory end can be truncated by keyhole-loss (last observed keyhole +
+  a short tail) to avoid drifted keyhole states affecting stop logic.
+- A post-end validation pass can extend trajectory end when later frames still
+  contain consistent keyhole-like evidence, reducing accidental early cutoff.
+
+---
+
 ## Prerequisites
 
 - **NVIDIA GPU** with CUDA support (Ampere or newer recommended)

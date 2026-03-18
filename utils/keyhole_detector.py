@@ -70,16 +70,18 @@ def _find_first_keyhole_frame(filtered, min_x=100):
     return None
 
 
-def _interpolate_positions(filtered, first_frame, last_frame):
+def _interpolate_positions(filtered, first_frame, last_frame, extrapolation_mode="linear"):
     """
-    Linearly interpolate keyhole position for frames between first_frame
-    and last_frame that are missing from filtered detections.
-    Extrapolates at constant position after the last known detection.
+    Linearly interpolate keyhole position for missing frames.
+    Extrapolates after the last known detection using either:
+      - "linear": continue last measured velocity
+      - "constant": hold last position
 
     Args:
         filtered:    {frame_idx: dict(x, y, w, h, cx, cy, ...)}
         first_frame: first frame to include in the output
         last_frame:  last frame to include (inclusive)
+        extrapolation_mode: "linear" or "constant"
 
     Returns:
         OrderedDict: {frame_idx: {"cx", "cy", "bbox": [x1,y1,x2,y2]}}
@@ -116,13 +118,32 @@ def _interpolate_positions(filtered, first_frame, last_frame):
             y2 = (c1["y"] + c1["h"]) + t * ((c2["y"] + c2["h"]) - (c1["y"] + c1["h"]))
             positions[f_start + j] = {"cx": cx, "cy": cy, "bbox": [x1, y1, x2, y2]}
 
-    # Extrapolate at constant position after the last detection
+    # Extrapolate after the last detection.
     if last_frame > frames[-1]:
         last_c = filtered[frames[-1]]
-        bbox   = [last_c["x"], last_c["y"],
-                  last_c["x"] + last_c["w"], last_c["y"] + last_c["h"]]
-        for fidx in range(frames[-1] + 1, last_frame + 1):
-            positions[fidx] = {"cx": last_c["cx"], "cy": last_c["cy"], "bbox": bbox}
+        if extrapolation_mode == "linear" and len(frames) >= 2:
+            prev_c = filtered[frames[-2]]
+            dt = max(1, frames[-1] - frames[-2])
+            vx = (last_c["cx"] - prev_c["cx"]) / dt
+            vy = (last_c["cy"] - prev_c["cy"]) / dt
+            # Keep box size fixed during extrapolation to avoid runaway bbox growth.
+            w = last_c["w"]
+            h = last_c["h"]
+
+            for fidx in range(frames[-1] + 1, last_frame + 1):
+                step = fidx - frames[-1]
+                cx = last_c["cx"] + vx * step
+                cy = last_c["cy"] + vy * step
+                x1 = cx - w / 2.0
+                y1 = cy - h / 2.0
+                x2 = cx + w / 2.0
+                y2 = cy + h / 2.0
+                positions[fidx] = {"cx": cx, "cy": cy, "bbox": [x1, y1, x2, y2]}
+        else:
+            bbox = [last_c["x"], last_c["y"],
+                    last_c["x"] + last_c["w"], last_c["y"] + last_c["h"]]
+            for fidx in range(frames[-1] + 1, last_frame + 1):
+                positions[fidx] = {"cx": last_c["cx"], "cy": last_c["cy"], "bbox": bbox}
 
     return OrderedDict(sorted(positions.items()))
 

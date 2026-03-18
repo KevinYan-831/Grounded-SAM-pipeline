@@ -51,6 +51,60 @@ def load_models(gdino_model_id, sam2_checkpoint, sam2_model_cfg):
     return gdino_processor, gdino_model, image_predictor, device
 
 
+def read_image_any(img_path):
+    """
+    Read an image as uint8 RGB, handling high bit-depth TIFFs.
+    """
+    ext = os.path.splitext(img_path)[-1].lower()
+    is_tiff = ext in (".tif", ".tiff")
+
+    def _to_uint8(img):
+        if img.dtype == np.uint8:
+            return img
+        max_val = float(img.max()) if img.size else 1.0
+        if max_val > 255:
+            img = (img.astype(np.float32) / max_val * 255.0).astype(np.uint8)
+        else:
+            img = img.astype(np.uint8)
+        return img
+
+    if is_tiff:
+        # Try tifffile first for better 12/16-bit support.
+        try:
+            import tifffile  # type: ignore
+            img = tifffile.imread(img_path)
+            img = _to_uint8(img)
+            if img.ndim == 2:
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+            elif img.ndim == 3 and img.shape[2] == 1:
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+            return img
+        except Exception:
+            if not getattr(read_image_any, "_tifffile_warned", False):
+                print("Note: tifffile not installed or failed to read. "
+                      "Install with 'pip install tifffile' for best TIFF support.")
+                setattr(read_image_any, "_tifffile_warned", True)
+
+        # Fallback to OpenCV for high bit depth TIFFs.
+        img = cv2.imread(img_path, cv2.IMREAD_ANYDEPTH | cv2.IMREAD_ANYCOLOR)
+        if img is None:
+            raise ValueError(f"Could not read image: {img_path}")
+        img = _to_uint8(img)
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+        elif img.ndim == 3 and img.shape[2] == 1:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+        else:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return img
+
+    # Non-TIFFs: standard OpenCV read.
+    img = cv2.imread(img_path)
+    if img is None:
+        raise ValueError(f"Could not read image: {img_path}")
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
 def extract_and_crop_frames(video_path, output_dir, crop_top=None):
     """
     Extract video frames and optionally crop them.
@@ -113,6 +167,7 @@ def detect_on_frame(
     img_w,
     max_box_area_ratio,
     device,
+    crop_bottom_height=None,
 ):
     """
     Run Grounding DINO on a single frame with the given text prompt.
@@ -122,7 +177,10 @@ def detect_on_frame(
     """
     img_area = img_h * img_w
     fpath = os.path.join(source_dir, frame_names[frame_idx])
-    image = Image.open(fpath).convert("RGB")
+    image_np = read_image_any(fpath)
+    if crop_bottom_height is not None and image_np.shape[0] > crop_bottom_height:
+        image_np = image_np[-crop_bottom_height:, :, :]
+    image = Image.fromarray(image_np)
 
     inputs = gdino_processor(
         images=image, text=text_prompt, return_tensors="pt"

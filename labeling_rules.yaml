@@ -21,6 +21,7 @@ detection:
     min_aspect_ratio: 1.5        # h/w must be >= this (taller than wide)
     max_top_y: 20                # y1 of box must be <= this (keyhole starts at image top)
     box_threshold: 0.15          # lower threshold so dim keyholes are not missed
+    rescue_box_threshold: 0.08   # global GDINO pass threshold floor to recover small keyholes
     max_box_area_ratio: 0.10     # keyholes can be larger than bubbles
     # If true, use SAM2 point-prompt segmentation to refine the keyhole bbox
     # after the leftmost-detection step.  More accurate but slower (~+5 min).
@@ -32,8 +33,97 @@ detection:
 keyhole_trajectory:
   max_jump_px: 120              # reject detections whose cx jumps more than this
   median_window: 30             # local median window (frames) for outlier rejection
+  min_filtered_frames: 4        # fallback to raw detections if temporal filter keeps too few
   smoothing_window: 5           # rolling average for final positions
-  first_frame_min_x: 100        # real keyhole starts at x > this (filter early artifacts)
+  first_frame_min_x: 0        # real keyhole starts at x > this (filter early artifacts)
+  extrapolation_mode: "linear"  # "linear" keeps moving after detector dropouts
+  end_on_keyhole_loss: true
+  min_observed_frames_for_loss_rule: 3
+  max_unobserved_tail_frames: 8  # after last observed keyhole, keep at most this many frames
+  stop_min_leftward_px: 0.2     # min px of leftward motion to be considered "moving"
+  stop_still_window: 5          # consecutive frames below min_leftward => trajectory ends
+  stop_left_edge_x: 70          # only end once keyhole is this far left (or further)
+
+# --- Trajectory End Validation ---
+# Uses all-frame detections to prevent accidental early trajectory truncation.
+keyhole_end_validation:
+  enabled: true
+  box_threshold: 0.08
+  min_run_frames: 5
+  max_gap_frames: 2
+  min_avg_score: 0.08
+  max_rightward_slope_px_per_frame: 0.3
+  left_edge_margin_px: 8
+  extend_tail_frames: 6
+  top_y_slack_px: 140
+  min_height_scale: 0.4
+  max_width_scale: 2.5
+  min_aspect_ratio_scale: 0.3
+  max_area_ratio_scale: 2.0
+
+# --- Keyhole Selection ---
+# Choose how to identify the keyhole before trajectory building.
+keyhole_selection:
+  method: "hybrid"              # "shape", "track", or "hybrid"
+  enable_shape_relaxation: true
+  relaxed_min_height_px: 10
+  relaxed_min_aspect_ratio: 0.25
+  relaxed_max_width_px: 260
+  relaxed_top_y_slack_px: 140
+  track_min_frames: 5           # minimum frames for a track-based keyhole
+  track_prefer_ratio: 0.6       # choose track if length >= ratio * shape length
+  track_min_leftward_px: 5.0    # require net leftward motion to accept track
+  track_min_leftmost_ratio: 0.45  # keyhole should often be one of the leftmost detections
+  track_box_threshold: 0.08     # relaxed candidate threshold for robust tracking
+  track_max_box_area_ratio: 0.18
+  track_top_y_slack_px: 140
+  track_min_height_px: 8
+  track_max_width_px: 220
+  track_iou_threshold: 0.08
+  track_max_gap: 8
+  track_min_length: 1
+  merge_max_gap_frames: 20
+  merge_max_distance_px: 120
+  merge_right_tolerance_px: 20
+  bubble_exclusion_iou: 0.60    # high IoU => likely same object as keyhole
+  bubble_exclusion_center_px: 10
+  bubble_exclusion_area_ratio_min: 0.5  # center-close exclusion applies only for similar-size boxes
+  bubble_exclusion_area_ratio_max: 2.0
+  bubble_exclusion_overlap_min: 0.60     # overlap/min(area) threshold for duplicate removal
+  leftmost_weight: 3.0
+  early_start_weight: 1.5
+  occupancy_weight: 2.0
+  velocity_require: true        # require near-constant velocity for track selection
+  velocity_max_residual_px: 8.0 # max RMS residual (px) from linear fit
+  velocity_weight: 2.0          # score bonus for velocity consistency
+  rescue_when_shape_missing: true
+  rescue_min_track_frames: 2
+  rescue_min_avg_score: 0.08
+
+# --- Keyhole Recovery (after detection/refinement) ---
+# Keeps tracking continuity when GDINO/SAM temporarily lose keyhole.
+keyhole_recovery:
+  enabled: false
+  min_seed_frames: 3
+  search_radius_x: 90
+  search_radius_y: 40
+  template_match_min_score: 0.25
+  detection_min_score: 0.08
+  detection_max_dist_px: 120
+  max_right_drift_px: 8
+  max_step_px: 40
+  min_left_step_px: 0.8
+  size_change_tolerance: 2.5
+  max_pred_only_gap: 2          # avoid long free-running drift
+  max_recover_horizon_frames: 12
+
+# --- Bubble Validity Rules ---
+bubble_validity:
+  require_right_of_keyhole: true
+  min_dx_from_keyhole_px: 0.0   # bubble center must be >= keyhole center + this margin
+  apply_only_when_observed: true
+  observed_frame_tolerance: 2   # apply rule only near frames with observed keyhole detections
+  ignore_if_keyhole_out_of_frame: true
 
 # --- Tracking Parameters ---
 tracking:
