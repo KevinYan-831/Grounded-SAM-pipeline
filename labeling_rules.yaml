@@ -9,7 +9,7 @@
 detection:
   bubble:
     text_prompt: "bubble.pore"
-    box_threshold: 0.25
+    box_threshold: 0.30
     max_box_area_ratio: 0.03
 
   keyhole:
@@ -35,6 +35,17 @@ keyhole_trajectory:
   smoothing_window: 5           # rolling average for final positions
   first_frame_min_x: 100        # real keyhole starts at x > this (filter early artifacts)
 
+# --- Manual Keyhole Tracking (LabelMe + SAM2) ---
+# Used by labeling_pipeline_manual_keyhole.py.
+manual_keyhole:
+  # If SAM mask is invalid on a frame, create a square bbox centered on the
+  # interpolated point with this half-size.
+  fallback_box_half_size_px: 10
+  # Optional smoothing on keyhole center trajectory (bbox stays frame-specific).
+  smoothing_window: 3
+  # If true, invalid SAM frame reuses previous valid bbox before point-box fallback.
+  keep_previous_bbox_on_invalid_mask: true
+
 # --- Tracking Parameters ---
 tracking:
   track_iou_threshold: 0.2
@@ -59,54 +70,38 @@ proximity:
   # Distance threshold (pixels) — bubbles within this distance are "near keyhole"
   near_threshold_pixels: 150
 
-# --- Track Duration Classification ---
-# Determines whether a bubble track is "transient" or "permanent".
-track_classification:
-  # Tracks shorter than this (in frames) are "transient"
-  transient_max_frames: 30
-  # Tracks at least this long (in frames) are "permanent"
-  permanent_min_frames: 30
-
-# --- Label Definitions (5 categories) ---
+# --- Label Definitions (4 categories, generation-based) ---
+# Labels are based on bubble GENERATION (birth), not presence.
 labels:
-  no_signal:
-    id: 0
-    name: "No Signal"
-    description: "No keyhole detected in the frame"
-    color: [128, 128, 128]   # gray
-
   normal_process:
-    id: 1
+    id: 0
     name: "Normal Process"
-    description: "Keyhole present, and NO bubbles exist anywhere in the entire video"
+    description: "No bubble is ever generated in the entire trajectory (within keyhole range)"
     color: [0, 255, 0]       # green
 
   unstable_no_pore:
-    id: 2
+    id: 1
     name: "Unstable Process without Pore Generation"
-    description: "Keyhole present, no bubbles at this frame, but bubbles exist elsewhere in the video"
+    description: "Bubbles exist in the trajectory, but no new bubble is born at this frame"
     color: [255, 255, 0]     # yellow
+
+  permanent_pore:
+    id: 2
+    name: "Permanent Pore Generation"
+    description: >
+      A bubble is born at this frame that persists until the last annotated frame.
+      Permanent wins when both permanent and transient bubbles are born on the same frame.
+    color: [255, 0, 0]       # red
 
   transient_pore:
     id: 3
     name: "Transient Pore Generation"
     description: >
-      At least one bubble at this frame will disappear later (transient track).
-      PRIORITY: transient beats permanent — even if permanent bubbles also exist
-      at this frame, the presence of any transient bubble gives label 3.
+      A bubble is born at this frame that disappears before the last annotated frame.
+      Only assigned when no permanent bubble is also born at this frame.
     color: [255, 165, 0]     # orange
-
-  permanent_pore:
-    id: 4
-    name: "Permanent Pore Generation"
-    description: >
-      All bubbles at this frame are permanent (none will disappear).
-      Only assigned when no transient bubbles are present at this frame.
-    color: [255, 0, 0]       # red
 
 # --- Interval Grouping ---
 intervals:
   # Minimum frames for an interval to be kept (shorter runs are merged into neighbors)
   min_interval_length: 1
-  # Majority-vote smoothing window to reduce label flickering between frames
-  smoothing_window: 5

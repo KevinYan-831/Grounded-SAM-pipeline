@@ -1,86 +1,57 @@
-# Grounded-SAM Bubble Detection Pipeline
+# X-Ray Welding Video Analysis Pipeline
 
-Detect and segment bubbles in X-ray videos using **Grounding DINO** (local, via HuggingFace Transformers) and **SAM 2.1** (Segment Anything Model 2), with **temporal track filtering** to remove transient false positives.
+Detect bubbles (pores) and keyholes in X-ray welding videos using **Grounding DINO** + **SAM 2.1**, then classify each frame by the type of pore generation occurring.
 
 ---
 
-## Pipeline Overview
+## How It Works (High Level)
 
-The pipeline uses a two-pass architecture with temporal filtering between passes:
+1. User annotates two frames per trajectory in **LabelMe** (keyhole start/end points)
+2. Pipeline interpolates keyhole position and segments it with **SAM2** per frame
+3. **Grounding DINO** detects bubbles on every frame (separate from keyhole)
+4. Bubbles are tracked across frames (IoU matching), merged if fragmented
+5. Each frame is labeled based on what type of bubble will be **generated next**
+
+---
+
+## Label Definitions (4 States)
+
+Labels are **generation-based**: they describe what bubble is about to emerge from the keyhole, not what bubbles are currently visible.
+
+| ID | Label | Description | Color |
+|----|-------|-------------|-------|
+| 0 | Normal Process | No bubble is ever generated in the entire trajectory | Green |
+| 1 | Unstable Process without Pore Generation | Bubbles exist in trajectory, but no upcoming generation event at this frame | Yellow |
+| 2 | Permanent Pore Generation | The next bubble to appear will persist until the end of the trajectory | Red |
+| 3 | Transient Pore Generation | The next bubble to appear will disappear before the end | Orange |
+
+### How generation labeling works
+
+Bubbles emerge from inside the keyhole and can't be detected as separate objects until they move away. So the moment a bubble is first detected by GDINO (frame `t`) is **after** it was actually generated.
+
+For each new bubble first detected at frame `t`, only the **single frame `t - 1`** (immediately before detection) receives the generation label. All other frames get label 1 (Unstable).
 
 ```
-Input video
-    │
-    ▼
-┌─────────────────────────────────────────┐
-│  Step 1: Load models                    │
-│  • Grounding DINO (HuggingFace)         │
-│  • SAM 2.1 image predictor              │
-└─────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────┐
-│  Step 2: Extract & crop video frames    │
-│  • Decode video → JPEG frames           │
-│  • Crop to ROI (bottom 310 rows)        │
-└─────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────┐
-│  Step 3–4: Find start frame             │
-│  • Coarse scan (10 evenly-spaced        │
-│    probes) to find first detection       │
-│  • Binary search to refine exact frame  │
-└─────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────┐
-│  Step 5: Pass 1 — Detection only        │
-│  • Run Grounding DINO on every frame    │
-│  • Store raw bounding boxes + scores    │
-│  • No segmentation yet (fast)           │
-└─────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────┐
-│  Step 6: Temporal track filtering       │
-│  • Link detections across frames        │
-│    using IoU-based greedy matching      │
-│  • Build tracks (consistent bubble IDs) │
-│  • Discard tracks shorter than          │
-│    MIN_TRACK_LENGTH frames              │
-└─────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────┐
-│  Step 7: Pass 2 — Segmentation          │
-│  • Run SAM 2.1 only on filtered boxes   │
-│  • Generate instance masks per frame    │
-│  • Save annotated frames + masks        │
-└─────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────┐
-│  Steps 8–9: Output                      │
-│  • Save detections.json (with track     │
-│    IDs, per-bubble info, summary)       │
-│  • Compile annotated frames → MP4 video │
-└─────────────────────────────────────────┘
+Per-frame logic:
+  1. If NO bubbles exist anywhere in the trajectory -> label 0 (Normal)
+  2. If this frame is t-1 of a permanent bubble birth -> label 2 (Permanent wins)
+  3. If this frame is t-1 of a transient bubble birth -> label 3
+  4. Otherwise -> label 1 (Unstable)
+
+Example timeline (start=120, end=443):
+
+Frame 140: T0  born next frame (permanent) -> label 2
+Frame 156: T6  born next frame (permanent) -> label 2
+Frame 223: T17 born next frame (transient) -> label 3
+Frame 226: T18 born next frame (permanent) -> label 2
+All other frames (120-139, 141-155, ...):  -> label 1
 ```
 
-### Why two passes?
+### Permanent vs transient classification
 
-Per-frame detection is noisy — Grounding DINO sometimes produces false positives that appear for 1–2 frames then vanish. By detecting all frames first (Pass 1), building temporal tracks, and filtering out short-lived tracks, we ensure only persistent, real bubbles reach the segmentation step (Pass 2). This also saves GPU time by not running SAM 2 on false positives.
-
-### How tracking works
-
-1. For each frame, compute IoU between every new detection and the last known box of each active track.
-2. Greedily match pairs by highest IoU (must exceed `TRACK_IOU_THRESHOLD`).
-3. Matched detections extend their track; unmatched detections start new tracks.
-4. Tracks not seen for `MAX_TRACK_GAP` consecutive frames are finalized.
-5. After all frames, tracks with fewer than `MIN_TRACK_LENGTH` entries are discarded as transient noise.
-
-Each surviving bubble gets a consistent `track_id` across all frames it appears in.
+- **Permanent**: bubble track's last detected frame >= `end_frame` (keyhole end annotation)
+- **Transient**: bubble track disappears before `end_frame`
+- No duration thresholds — classification is purely based on whether the bubble persists to the end of the analyzed range
 
 ---
 
@@ -88,350 +59,248 @@ Each surviving bubble gets a consistent `track_id` across all frames it appears 
 
 ```
 Grounded-SAM-pipeline/
-├── bubbles_detection_pipeline.py   # Detection pipeline (two-pass + temporal filtering)
-├── labeling_pipeline.py            # Frame labeling pipeline (5-category classification)
-├── labeling_rules.yaml             # Configurable rules for the labeling pipeline
-├── evaluate.py                     # Evaluation against labelme ground truth
-├── tune_params.py                  # Automatic hyperparameter grid search
-├── setup.py                        # SAM 2 package setup
-├── pyproject.toml                  # Build system config
-├── checkpoints/
-│   ├── download_ckpts.sh           # Download SAM 2.1 model weights
-│   └── sam2.1_hiera_*.pt           # SAM 2.1 checkpoints (not tracked)
-├── sam2/                           # SAM 2 library source
+├── labeling_pipeline_manual_keyhole.py  # PRIMARY: manual keyhole + auto bubble detection
+├── labeling_pipeline.py                 # Auto-keyhole pipeline (shared functions)
+├── labeling_rules.yaml                  # All configurable parameters
+├── run_labeling_batch.py                # Batch runner for multiple trajectories
+├── run_three_labeling_manual_keyhole.sh # Shell wrapper for batch runs
+├── build_transition_model.py            # Aggregate results into transition matrix
+├── prepare_keyhole_labelme_workspace.py # Convert TIFF trajectories to LabelMe-ready PNGs
+├── bubbles_detection_pipeline.py        # Standalone bubble detection (no labeling)
+├── evaluate.py                          # Evaluation against ground truth
+├── tune_params.py                       # Hyperparameter grid search
+├── setup.py                             # SAM2 package setup
 ├── utils/
-│   ├── video_utils.py              # Video creation utility
-│   ├── detection_utils.py          # Shared detection & tracking functions
-│   └── keyhole_detector.py         # Keyhole trajectory utilities (temporal filter, interpolation, smoothing)
-└── data/                           # Data directory (not tracked)
-    ├── raw/                        # Input videos
-    ├── frames/custom_video_frames/ # Extracted & cropped frames
-    ├── output/                     # Detection pipeline output
-    │   ├── detections.json
-    │   ├── masks/
-    │   ├── tracking_results/
-    │   └── bubbles_groundedSAM.mp4
-    ├── labeling/                   # Labeling pipeline output
-    │   ├── labeling_results.json   # Per-frame labels, intervals, track metadata
-    │   └── frames/                 # Annotated frames with label overlays
-    └── labelme/                    # Ground truth annotations
+│   ├── detection_utils.py               # Shared: load_models, detect_on_frame, build_and_filter_tracks
+│   ├── keyhole_detector.py              # Keyhole trajectory: temporal filter, interpolation, smoothing
+│   └── video_utils.py                   # Video creation utility
+├── checkpoints/                         # SAM 2.1 model weights (not tracked)
+└── sam2/                                # SAM 2 library source
 ```
 
 ---
 
-## Prerequisites
+## Pipelines
 
-- **NVIDIA GPU** with CUDA support (Ampere or newer recommended)
-- Python **3.10+**
-- PyTorch **2.1+** with CUDA
-- CUDA **11.8+**
+### 1. Manual Keyhole Pipeline (`labeling_pipeline_manual_keyhole.py`) — PRIMARY
+
+Used when keyhole auto-tracking is unreliable (which is typical). User provides keyhole start/end points via LabelMe annotations.
+
+**Steps:**
+1. Read LabelMe annotations (`keyhole_start`, `keyhole_end` point labels)
+2. Linearly interpolate keyhole prompt point between start and end frames
+3. Run SAM2 point-prompt segmentation per frame to get keyhole bounding box
+   - Tries all 3 SAM masks (highest score first), picks first one that passes shape validation (narrow + tall)
+   - Falls back to previous valid bbox, then to small point-box if all masks fail
+4. Run Grounding DINO bubble detection on analyzed frames only
+5. Filter bubbles: remove those overlapping keyhole bbox AND those to the LEFT of keyhole center (only right-side bubbles are real)
+6. Build IoU-based bubble tracks, merge fragmented tracks
+7. Classify tracks as permanent/transient based on whether they persist to `end_frame`
+8. Label each frame in `[start_frame, end_frame]` using generation-based logic
+9. Output labeled frames and `labeling_results.json`
+
+### 2. Auto-Keyhole Pipeline (`labeling_pipeline.py`)
+
+Fully automatic — detects keyhole by shape heuristic (leftmost tall/narrow GDINO detection). Useful when keyhole is reliably detected. Uses the same labeling logic as the manual pipeline.
+
+### 3. Standalone Detection Pipeline (`bubbles_detection_pipeline.py`)
+
+Raw two-pass bubble detection without labeling. Useful for inspecting what GDINO sees.
 
 ---
 
-## Installation
+## Quick Start
+
+### Prerequisites
+
+- NVIDIA GPU with CUDA (Ampere+ recommended)
+- Python 3.10+, PyTorch 2.1+ with CUDA
+
+### Installation
 
 ```bash
-# 1. Clone
-git clone https://github.com/KevinYan-831/Grounded-SAM-pipeline.git
-cd Grounded-SAM-pipeline
-
-# 2. Create environment
+# Create environment
 conda create -n grounded_sam2 python=3.10
 conda activate grounded_sam2
 
-# 3. Install PyTorch (match your CUDA version — see pytorch.org)
+# Install PyTorch (match your CUDA version)
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-# 4. Install SAM 2
+# Install SAM 2
 pip install -e .
 
-# 5. Install dependencies
-pip install transformers supervision opencv-python pillow tqdm numpy scipy
+# Install dependencies
+pip install transformers supervision opencv-python pillow tqdm numpy scipy pyyaml
 
-# 6. Download SAM 2.1 checkpoints
+# Download SAM 2.1 checkpoints
 cd checkpoints && bash download_ckpts.sh && cd ..
 ```
 
-Grounding DINO weights are **automatically downloaded** from HuggingFace on first run.
-
----
-
-## Preparing Data
+### Step 1: Prepare frames from TIFF trajectories
 
 ```bash
-mkdir -p data/raw
-cp /path/to/your/video.mp4 data/raw/x_ray_video.mp4
+python prepare_keyhole_labelme_workspace.py \
+  --data-root /path/to/xray-enhanced \
+  --output-root /path/to/xray-enhanced-frames
 ```
+
+Creates one directory per trajectory with frames `00000.png ... NNNNN.png`.
+
+### Step 2: Annotate keyhole in LabelMe
+
+```bash
+labelme /path/to/xray-enhanced-frames/<prefix>/<trajectory_name>
+```
+
+On two frames:
+- First keyhole frame: one point labeled **`keyhole_start`**
+- Last keyhole frame: one point labeled **`keyhole_end`**
+
+(Fallback: label both as `keyhole`; earliest = start, latest = end.)
+
+### Step 3: Run labeling
+
+**Single trajectory:**
+
+```bash
+python labeling_pipeline_manual_keyhole.py \
+  --config labeling_rules.yaml \
+  --frames-dir /path/to/frames/<trajectory> \
+  --output /path/to/output/<trajectory>/labeling_results.json \
+  --output-frames-dir /path/to/output/<trajectory>/frames \
+  --video-path /path/to/frames/<trajectory> \
+  --skip-extraction
+```
+
+**All trajectories (batch):**
+
+```bash
+python run_labeling_batch.py \
+  --data-root /path/to/xray-enhanced-frames \
+  --output-root /path/to/labeling_results \
+  --exts png \
+  --manual-keyhole-from-labelme \
+  --skip-existing
+```
+
+Or use the shell wrapper (paths hardcoded inside):
+
+```bash
+bash run_three_labeling_manual_keyhole.sh
+```
+
+Add `--dry-run` to preview what would run without executing. Unannotated trajectories are automatically skipped.
+
+### Step 4: Build transition model
+
+```bash
+python build_transition_model.py \
+  --results-root /path/to/labeling_results
+```
+
+Aggregates all `labeling_results.json` files into a 4x4 transition probability matrix and per-trajectory CSV summary.
 
 ---
 
-## Configuration
+## Configuration (`labeling_rules.yaml`)
 
-All parameters are at the top of `bubbles_detection_pipeline.py`:
-
-### Detection parameters
+### Detection
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `VIDEO_PATH` | `./data/raw/x_ray_video.mp4` | Input video path |
-| `TEXT_PROMPT` | `"bubble."` | Text prompt for Grounding DINO |
-| `GDINO_MODEL_ID` | `IDEA-Research/grounding-dino-base` | HuggingFace model ID |
-| `BOX_THRESHOLD` | `0.35` | Confidence threshold for detections (0–1) |
-| `MAX_BOX_AREA_RATIO` | `0.07` | Discard boxes larger than this fraction of image area |
-| `DETECT_INTERVAL` | `1` | Run detection every N frames (1 = every frame) |
-| `CROP_TOP` | `490` | Crop frames starting from this row (800 - 310) |
+| `detection.bubble.text_prompt` | `"bubble.pore"` | GDINO text prompt |
+| `detection.bubble.box_threshold` | `0.30` | Confidence threshold for bubble detections |
+| `detection.bubble.max_box_area_ratio` | `0.03` | Max box area as fraction of image |
+| `detection.keyhole.min_height` | `50` | Min height (px) for keyhole shape validation |
+| `detection.keyhole.max_width` | `100` | Max width (px) — keyhole must be narrow |
+| `detection.keyhole.min_aspect_ratio` | `1.5` | Min h/w ratio — keyhole must be tall |
+| `detection.keyhole.use_sam_refinement` | `true` | Refine keyhole bbox with SAM2 point prompt |
 
-### Temporal filtering parameters
+### Tracking
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `MIN_TRACK_LENGTH` | `10` | Minimum frames a track must span to be kept |
-| `TRACK_IOU_THRESHOLD` | `0.3` | Minimum IoU to link a detection to an existing track |
-| `MAX_TRACK_GAP` | `2` | Max consecutive frames a track can go unmatched before ending |
+| `tracking.track_iou_threshold` | `0.2` | Min IoU to link detections across frames |
+| `tracking.max_track_gap` | `5` | Max frames a track can go undetected |
+| `tracking.bubble_min_track_length` | `1` | Min frames for a track to be kept |
+| `track_merging.max_gap_frames` | `30` | Max temporal gap to merge fragmented tracks |
+| `track_merging.max_distance_px` | `50` | Max spatial distance to merge tracks |
 
-### SAM 2.1 model options
+### Manual Keyhole
 
-| Model | Checkpoint | Config |
-|-------|-----------|--------|
-| Tiny | `sam2.1_hiera_tiny.pt` | `sam2.1_hiera_t.yaml` |
-| Small | `sam2.1_hiera_small.pt` | `sam2.1_hiera_s.yaml` |
-| Base+ | `sam2.1_hiera_base_plus.pt` | `sam2.1_hiera_b+.yaml` |
-| **Large** | `sam2.1_hiera_large.pt` | `sam2.1_hiera_l.yaml` |
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `manual_keyhole.fallback_box_half_size_px` | `10` | Half-size of fallback bbox when SAM fails |
+| `manual_keyhole.smoothing_window` | `3` | Rolling average on keyhole center trajectory |
+| `manual_keyhole.keep_previous_bbox_on_invalid_mask` | `true` | Reuse last valid bbox before point-box fallback |
 
 ---
 
-## Running the Pipeline
+## Output Format
 
-```bash
-conda activate grounded_sam2
-python bubbles_detection_pipeline.py
-```
-
-### Output files
-
-| File | Description |
-|------|-------------|
-| `data/output/detections.json` | Per-frame detection results with track IDs, bounding boxes, confidence scores, mask areas, and summary statistics |
-| `data/output/masks/*.npy` | Raw binary instance masks per frame (shape: `[N, H, W]`) |
-| `data/output/tracking_results/*.jpg` | Annotated frames with boxes, labels (`bubble T<id>`), and color masks |
-| `data/output/bubbles_groundedSAM.mp4` | Final annotated video |
-
-### JSON output format
+### `labeling_results.json`
 
 ```json
 {
-  "video_path": "./data/raw/x_ray_video.mp4",
-  "text_prompt": "bubble.",
-  "model": "IDEA-Research/grounding-dino-base",
-  "box_threshold": 0.35,
-  "max_box_area_ratio": 0.07,
-  "min_track_length": 10,
-  "track_iou_threshold": 0.3,
-  "image_size": {"width": 640, "height": 310},
-  "total_frames_processed": 1050,
-  "frames_with_detections": 850,
-  "total_bubbles_detected": 5230,
-  "raw_detections_before_filter": 6100,
-  "total_tracks": 120,
-  "valid_tracks": 15,
-  "start_frame_index": 950,
-  "tracks": [
-    {
-      "track_id": 3,
-      "num_frames": 200,
-      "first_frame": 960,
-      "last_frame": 1160
-    }
+  "keyhole_detection_method": "manual_labelme_sam",
+  "analysis_frame_range": [120, 443],
+  "label_definitions": { ... },
+  "summary": {
+    "Normal Process": 0,
+    "Unstable Process without Pore Generation": 235,
+    "Permanent Pore Generation": 188,
+    "Transient Pore Generation": 123
+  },
+  "intervals": [
+    {"start_frame": 120, "end_frame": 141, "label_id": 2, "label_name": "Permanent Pore Generation", ...}
   ],
-  "frames": [
-    {
-      "frame_index": 960,
-      "frame_file": "00960.jpg",
-      "num_bubbles": 3,
-      "bubbles": [
-        {
-          "id": 0,
-          "track_id": 3,
-          "label": "bubble",
-          "confidence": 0.4521,
-          "bbox": [120.5, 80.3, 145.2, 105.8],
-          "bbox_area": 630.25,
-          "mask_area_pixels": 512
-        }
-      ]
-    }
+  "tracks": {
+    "bubble_tracks": [
+      {"track_id": 0, "first_frame": 141, "last_frame": 443, "is_permanent": true, ...}
+    ]
+  },
+  "label_sequence": [2, 2, 2, ...],
+  "transition_counts": [[...], [...], [...], [...]],
+  "frame_labels": [
+    {"frame_index": 120, "label_id": 2, "label_name": "Permanent Pore Generation", ...}
   ]
 }
 ```
 
----
+### Annotated frames
 
-## Frame Labeling Pipeline
-
-A separate pipeline that classifies each video frame into one of 5 process states based on keyhole presence and bubble behavior.
-
-### Label categories
-
-| ID | Label | Description |
-|----|-------|-------------|
-| 0 | No Signal | No keyhole detected at this frame |
-| 1 | Normal Process | Keyhole present; **no bubbles exist anywhere** in the entire video |
-| 2 | Unstable Process without Pore Generation | Keyhole present; no bubble at this frame, but bubbles exist elsewhere in the video |
-| 3 | Transient Pore Generation | At least one bubble at this frame **will disappear** later |
-| 4 | Permanent Pore Generation | All bubbles at this frame are permanent (none will disappear) |
-
-#### Labeling priority hierarchy
-
-Labels are assigned in the following order of precedence (first matching rule wins):
-
-```
-0  No keyhole detected
-↓
-1  Keyhole present, zero bubbles in entire video
-↓
-2  Keyhole present, no bubbles at this frame (but exist elsewhere)
-↓
-3  Any bubble at this frame is transient  ← transient beats permanent
-↓
-4  All bubbles at this frame are permanent
-```
-
-> **Transient takes priority over permanent (label 3 > label 4).**
-> If a frame contains both a transient bubble and a permanent bubble,
-> it is labeled 3 — because a new transient pore generation event is occurring.
-
-### How it works
-
-1. **GDINO detection** — Runs Grounding DINO once per frame with the `"bubble.pore"` prompt using a broad threshold to capture both bubbles and the keyhole in a single pass.
-2. **Keyhole split (leftmost heuristic)** — Among all detections in a frame, the leftmost box with height ≥ `min_height` is the keyhole candidate. The keyhole sits at the leading edge of the weld pool and moves right→left over time, so it is always the leftmost active feature.
-3. **Optional SAM2 refinement** — If `use_sam_refinement: true`, SAM2's point-prompt segmentation is run on each keyhole candidate using its center coordinate, producing a more precise bounding box.
-4. **Keyhole trajectory** — Temporal outlier rejection (local median filter on cx) → find first real keyhole frame → linear interpolation of gaps → rolling-average smoothing.
-5. **Bubble tracks** — IoU-based tracking builds per-bubble tracks across all frames.
-6. **Track classification** — Each bubble track is tagged as transient (`duration < transient_max_frames`) or permanent (`duration ≥ permanent_min_frames`), and near/far relative to the keyhole center.
-7. **Per-frame labeling** — The priority hierarchy above assigns one of 5 labels to each frame.
-8. **Smoothing & output** — Majority-vote smoothing reduces flickering; results are grouped into labeled time intervals and saved.
-
-### Running
-
-```bash
-# If frames are already extracted (from the detection pipeline):
-python labeling_pipeline.py --skip-extraction
-
-# Skip GDINO detection too (reuse cached raw_detections.json):
-python labeling_pipeline.py --skip-extraction --skip-detection
-
-# Full run (extracts frames from video first):
-python labeling_pipeline.py
-
-# Custom config:
-python labeling_pipeline.py --config my_rules.yaml --skip-extraction
-```
-
-### Configuration (`labeling_rules.yaml`)
-
-| Section | Key parameters |
-|---------|---------------|
-| `detection.bubble` | `text_prompt`, `box_threshold`, `max_box_area_ratio` |
-| `detection.keyhole` | `min_height`, `box_threshold`, `max_box_area_ratio`, `use_sam_refinement` |
-| `keyhole_trajectory` | `max_jump_px`, `median_window`, `smoothing_window`, `first_frame_min_x` |
-| `tracking` | `track_iou_threshold`, `max_track_gap`, `bubble_min_track_length` |
-| `track_classification` | `transient_max_frames`, `permanent_min_frames` |
-| `proximity` | `method`, `near_threshold_pixels` |
-| `labels` | Label names, IDs, colors, descriptions |
-| `intervals` | `smoothing_window`, `min_interval_length` |
-
-**To enable SAM2 keyhole refinement**, set in `labeling_rules.yaml`:
-```yaml
-detection:
-  keyhole:
-    use_sam_refinement: true
-```
-This passes the approximate keyhole center to SAM2 as a point prompt and replaces the GDINO bounding box with the SAM-derived one. More accurate but adds ~5 minutes to the run.
-
-### Output
-
-| File | Description |
-|------|-------------|
-| `data/labeling/labeling_results.json` | Per-frame labels, time intervals, bubble track metadata, keyhole positions |
-| `data/labeling/raw_detections.json` | Cached raw GDINO detections (reused with `--skip-detection`) |
-| `data/labeling/frames/*.jpg` | Annotated frames: colored label bar at top, white keyhole box, bubble boxes (red = permanent, orange = transient near keyhole, cyan = far) |
+Saved to the output frames directory. Each frame has:
+- Colored label bar at top (green/yellow/red/orange)
+- White keyhole bounding box
+- Red bubble bounding boxes with track IDs
 
 ---
 
-## Evaluation & Tuning
+## Key Design Decisions
 
-### 1. Annotate ground truth
+1. **Manual keyhole annotation** is preferred because auto-detection (GDINO shape heuristic) is unreliable — the keyhole appearance varies across trajectories.
 
-Select random frames from pipeline output and annotate with labelme:
+2. **Only bubbles to the RIGHT of the keyhole** are counted. Bubbles emerge from the keyhole and move rightward; detections to the left are noise.
 
-```bash
-python evaluate.py --select-frames --num-frames 10
-labelme data/labelme/
-```
+3. **Generation-based labeling** instead of presence-based: the label describes what is being generated from the keyhole, not what is currently visible. This is because at the exact moment of generation, the bubble is still inside the keyhole and undetectable.
 
-Label bubbles as polygons with the label `bubble`.
+4. **No label smoothing**: generation events are sparse (one frame per bubble birth), and majority-vote smoothing would erase them. The backward-fill approach provides naturally smooth intervals.
 
-### 2. Evaluate current parameters
+5. **Permanent wins over transient** when both types of bubbles are born around the same time, because permanent pore generation is a more significant process event.
 
-```bash
-python evaluate.py --iou-threshold 0.5
-```
-
-Reports pixel-level (precision, recall, F1, IoU) and instance-level (Hungarian matching) metrics.
-
-### 3. Automatic hyperparameter tuning
-
-```bash
-python tune_params.py
-```
-
-This runs a grid search over 864 parameter combinations in a **single run**:
-
-| Parameter | Values tested |
-|-----------|--------------|
-| `BOX_THRESHOLD` | 0.15, 0.2, 0.25, 0.3, 0.35, 0.4 |
-| `MAX_BOX_AREA_RATIO` | 0.03, 0.05, 0.07, 0.1 |
-| `MIN_TRACK_LENGTH` | 1, 3, 5, 10 |
-| `TRACK_IOU_THRESHOLD` | 0.2, 0.3, 0.4 |
-| `MAX_TRACK_GAP` | 1, 2, 3 |
-
-**How it works efficiently:**
-1. Grounding DINO runs **once** on all frames at the lowest threshold, caching every possible detection
-2. For each combo, filtering + tracking is replayed in pure Python (instant)
-3. SAM2 runs only on the ~20 labelme frames per combo
-
-**Output:** The script reports the best parameter combo for **every metric** in one run — no need to re-run with different flags. Example output:
-
-```
-BEST PARAMETERS PER METRIC (single run — no need to re-run)
-========================================================
-
-  pixel_precision = 0.9120
-    BoxTh=0.40  MaxArea=0.03  MinTrk=10  TrkIoU=0.40  MaxGap=1
-
-  pixel_f1 = 0.8450
-    BoxTh=0.25  MaxArea=0.07  MinTrk=5   TrkIoU=0.30  MaxGap=2
-
-  inst_f1 = 0.8100
-    BoxTh=0.30  MaxArea=0.05  MinTrk=3   TrkIoU=0.30  MaxGap=2
-```
-
-The `--metric` flag only controls which metric the **top-K table** is sorted by (default: `pixel_f1`). All metrics are always computed and shown.
-
-Full results are saved to `data/output/tuning_results.json`.
-
-Copy the best parameters back into `bubbles_detection_pipeline.py` and re-run the pipeline.
+6. **Track merging** handles GDINO detection gaps: if a bubble is missed for up to 30 frames but reappears nearby, the tracks are merged into one to avoid splitting a permanent bubble into multiple transient fragments.
 
 ---
 
-## Manual Tuning Guide
+## Tuning Guide
 
 | Problem | Solution |
 |---------|----------|
-| Too many false positives | Increase `BOX_THRESHOLD` or `MIN_TRACK_LENGTH` |
-| Missing real bubbles | Decrease `BOX_THRESHOLD` or `MIN_TRACK_LENGTH` |
-| Large spurious boxes | Decrease `MAX_BOX_AREA_RATIO` |
-| Tracks breaking for fast-moving bubbles | Decrease `TRACK_IOU_THRESHOLD` (e.g. 0.15) |
-| Tracks breaking due to missed detections | Increase `MAX_TRACK_GAP` (e.g. 5) |
-| Out of memory | Use a smaller SAM 2.1 model (tiny/small) |
-| Slow processing | Increase `DETECT_INTERVAL` to skip frames |
+| Too many false positive bubbles | Increase `detection.bubble.box_threshold` |
+| Missing real bubbles | Decrease `detection.bubble.box_threshold` |
+| Keyhole SAM mask too wide (includes bubbles) | Decrease `detection.keyhole.max_width` |
+| Tracks breaking for fast-moving bubbles | Decrease `tracking.track_iou_threshold` |
+| Permanent bubble split into transient fragments | Increase `track_merging.max_gap_frames` |
+| Too many short-lived noise tracks | Increase `tracking.bubble_min_track_length` |
+
+For systematic tuning, use `tune_params.py` (grid search over detection/tracking parameters against LabelMe ground truth) and `evaluate.py` (precision/recall/F1 evaluation).

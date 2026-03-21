@@ -1,22 +1,19 @@
 """
 Frame labeling pipeline for bubble detection in X-ray video.
 
-Assigns per-frame state labels based on keyhole presence, bubble proximity
-to the keyhole, and track persistence.  Outputs a labeled interval dataset
-as JSON.
+Assigns per-frame state labels based on bubble GENERATION (birth) relative
+to the keyhole range.  Outputs a labeled interval dataset as JSON.
 
 Keyhole detection uses Grounding DINO ("bubble.pore" prompt) — the same
 model used for bubbles.  Detections are split by shape:
   • leftmost detection with h ≥ min_height                  → keyhole
   • everything else                                          → bubble
 
-Labels:
-  0 - No Signal:                      No keyhole detected
-  1 - Normal Process:                 Keyhole present, NO bubbles in entire video
-  2 - Unstable without Pore:          Keyhole present, no bubble this frame, but
-                                      bubbles exist elsewhere in the video
-  3 - Transient Pore Generation:      Bubble at this frame that will disappear
-  4 - Permanent Pore Generation:      Bubble at this frame that stays permanently
+Labels (generation-based, 4 states):
+  0 - Normal Process:                 No bubble is ever generated in the trajectory
+  1 - Unstable without Pore:          Bubbles exist, but none born at this frame
+  2 - Permanent Pore Generation:      A bubble born at this frame persists to end
+  3 - Transient Pore Generation:      A bubble born at this frame disappears before end
 
 Usage:
     python labeling_pipeline.py
@@ -351,6 +348,8 @@ def merge_fragmented_tracks(tracks, config):
             gap = first_frame_j - last_frame
             if gap > max_gap:
                 break  # tracks are sorted; no later track can be closer
+            if gap < 0:
+                continue  # tracks overlap in time — distinct coexisting bubbles
 
             # Spatial distance between endpoints
             lcx = (last_box[0] + last_box[2]) / 2
@@ -444,28 +443,44 @@ def build_keyhole_trajectory(keyhole_raw, num_frames, config):
 # ─────────────────────────────────────────────────────────────
 # Classify bubble tracks by proximity & persistence
 # ─────────────────────────────────────────────────────────────
-def classify_bubble_tracks(bubble_tracks, keyhole_positions, config):
+def classify_bubble_tracks(bubble_tracks, keyhole_positions, config, end_frame=None):
     """
     For each bubble track, compute:
       - average distance to keyhole center (metadata only)
       - near/far classification (metadata only)
-      - transient/permanent classification (used for labels 3/4)
+      - transient/permanent classification based on whether the track
+        persists to the last analyzed frame (end_frame)
+
+    A track is **permanent** if its last frame == end_frame (the bubble
+    persists until the end of the analyzed range).  Otherwise it is
+    **transient**.
+
+    Args:
+        bubble_tracks: list of track dicts
+        keyhole_positions: {frame_idx: {"cx", "cy", "bbox"}}
+        config: full labeling_rules config dict
+        end_frame: last analyzed frame index; if None, uses max keyhole frame
 
     Returns:
         List of track dicts with added classification metadata.
     """
-    prox_cfg  = config["proximity"]
-    track_cfg = config["track_classification"]
+    prox_cfg = config["proximity"]
 
     near_threshold = prox_cfg["near_threshold_pixels"]
-    transient_max  = track_cfg["transient_max_frames"]
-    permanent_min  = track_cfg["permanent_min_frames"]
     method         = prox_cfg.get("method", "center_distance")
+
+    # Determine last analyzed frame
+    if end_frame is None:
+        if keyhole_positions:
+            end_frame = max(keyhole_positions.keys())
+        else:
+            end_frame = 0
 
     classified = []
     for track in bubble_tracks:
         entries  = track["entries"]
         duration = len(entries)
+        track_last_frame = entries[-1][0]
 
         distances = []
         for entry in entries:
@@ -490,8 +505,8 @@ def classify_bubble_tracks(bubble_tracks, keyhole_positions, config):
 
         avg_distance = float(np.mean(distances)) if distances else float("inf")
         is_near      = avg_distance <= near_threshold
-        is_permanent = duration >= permanent_min
-        is_transient = duration <  transient_max
+        is_permanent = track_last_frame >= end_frame
+        is_transient = track_last_frame < end_frame
 
         classified.append({
             **track,
@@ -500,6 +515,7 @@ def classify_bubble_tracks(bubble_tracks, keyhole_positions, config):
             "is_near_keyhole":         is_near,
             "is_permanent":            is_permanent,
             "is_transient":            is_transient,
+            "birth_frame":             entries[0][0],
         })
 
     near_count = sum(1 for t in classified if t["is_near_keyhole"])
@@ -515,114 +531,73 @@ def classify_bubble_tracks(bubble_tracks, keyhole_positions, config):
 # Per-frame labeling — corrected rules
 # ─────────────────────────────────────────────────────────────
 def label_frames(
-    num_frames, keyhole_positions,
     classified_bubble_tracks,
+    start_frame,
+    end_frame,
 ):
     """
-    Assign a label to each frame:
+    Assign a generation-based label to each frame in [start_frame, end_frame].
 
-      0 - No Signal:
-            No keyhole detected at this frame.
+    Bubbles emerge from the keyhole. When a new bubble is first detected
+    at frame `t`, the frame immediately before it (`t - 1`) is labeled as
+    the generation event.  Only that single frame gets label 2 or 3.
 
-      1 - Normal Process:
-            Keyhole present, AND across ALL frames in the entire video
-            there are NO bubbles at all.
+    Labels (4 states):
+      0 - Normal Process:
+            No bubble is ever generated in the entire trajectory.
 
-      2 - Unstable Process without Pore Generation:
-            Keyhole present, no bubble at THIS frame, but bubbles DO
-            exist somewhere across all frames in the video.
+      1 - Unstable Process without Pore Generation:
+            Bubbles exist in the trajectory, but this frame is not a
+            generation event.
+
+      2 - Permanent Pore Generation:
+            Frame immediately before a newly detected bubble that
+            persists until end_frame.  Permanent wins over transient.
 
       3 - Transient Pore Generation:
-            At least one bubble at this frame will eventually disappear.
-            TRANSIENT TAKES PRIORITY: even if permanent bubbles also exist
-            at this frame, the presence of ANY transient bubble makes the
-            frame label 3.
+            Frame immediately before a newly detected bubble that
+            disappears before end_frame.
 
-      4 - Permanent Pore Generation:
-            ALL bubbles at this frame are permanent (none are transient).
+    Args:
+        classified_bubble_tracks: list of classified track dicts (with birth_frame)
+        start_frame: first frame of analyzed range
+        end_frame: last frame of analyzed range
 
-    Priority hierarchy (highest wins):
-        0  (no keyhole)  is determined first,
-        1  (no bubbles globally) next,
-        2  (no bubbles here, but exist elsewhere) next,
-        3  (any transient bubble here) beats 4,
-        4  (only permanent bubbles here).
+    Returns:
+        dict {frame_idx: label_id} for frames in [start_frame, end_frame]
     """
-    # Build per-frame bubble track lookup
-    frame_tracks = defaultdict(list)
-    for track in classified_bubble_tracks:
-        for entry in track["entries"]:
-            frame_tracks[entry[0]].append(track)
-
-    # Global: does ANY bubble track exist in the entire video?
     has_any_bubbles = len(classified_bubble_tracks) > 0
 
+    if not has_any_bubbles:
+        return {f: 0 for f in range(start_frame, end_frame + 1)}
+
+    # For each bubble born at frame t, label frame t-1 as generation.
+    # Permanent (2) wins over transient (3) on the same frame.
+    generation_labels = {}
+    for track in classified_bubble_tracks:
+        gen_frame = track["birth_frame"] - 1
+        if gen_frame < start_frame:
+            continue
+        label = 2 if track["is_permanent"] else 3
+        if gen_frame not in generation_labels or label < generation_labels[gen_frame]:
+            generation_labels[gen_frame] = label
+
     frame_labels = {}
-    for fidx in range(num_frames):
-        has_keyhole     = fidx in keyhole_positions
-        tracks_here     = frame_tracks.get(fidx, [])
-        has_bubbles_now = len(tracks_here) > 0
-
-        # ── Label 0: No keyhole ──────────────────────────────────
-        if not has_keyhole:
-            frame_labels[fidx] = 0
-            continue
-
-        # ── Label 1: Keyhole + no bubbles anywhere in video ──────
-        if not has_any_bubbles:
-            frame_labels[fidx] = 1
-            continue
-
-        # ── Label 2: Keyhole + no bubbles at this frame ──────────
-        if not has_bubbles_now:
-            frame_labels[fidx] = 2
-            continue
-
-        # ── Labels 3 / 4: per-bubble classification ──────────────
-        # Transient takes priority: if ANY bubble at this frame is
-        # transient (will disappear), label the frame as 3.
-        # Only label 4 when every bubble here is permanent.
-        has_transient_here = any(t["is_transient"] for t in tracks_here)
-        frame_labels[fidx] = 3 if has_transient_here else 4
+    for fidx in range(start_frame, end_frame + 1):
+        frame_labels[fidx] = generation_labels.get(fidx, 1)
 
     return frame_labels
 
 
 # ─────────────────────────────────────────────────────────────
-# Label smoothing (majority vote)
-# ─────────────────────────────────────────────────────────────
-def smooth_labels(frame_labels, config):
-    """Apply majority-vote smoothing within a sliding window."""
-    window = config["intervals"].get("smoothing_window", 1)
-    if window <= 1:
-        return frame_labels
-
-    sorted_frames  = sorted(frame_labels.keys())
-    labels_array   = [frame_labels[f] for f in sorted_frames]
-    smoothed       = {}
-
-    for i, fidx in enumerate(sorted_frames):
-        start = max(0, i - window // 2)
-        end   = min(len(sorted_frames), i + window // 2 + 1)
-        window_labels = labels_array[start:end]
-        counts        = Counter(window_labels)
-        most_common   = counts.most_common()
-        top_count     = most_common[0][1]
-        candidates    = [lbl for lbl, cnt in most_common if cnt == top_count]
-        if labels_array[i] in candidates:
-            smoothed[fidx] = labels_array[i]
-        else:
-            smoothed[fidx] = most_common[0][0]
-
-    return smoothed
-
-
-# ─────────────────────────────────────────────────────────────
 # Group into time intervals
 # ─────────────────────────────────────────────────────────────
-def group_into_intervals(frame_labels, num_frames, config):
+def group_into_intervals(frame_labels, config):
     """
     Group consecutive frames with the same label into intervals.
+
+    Only frames present in frame_labels are considered (supports
+    labeling over a sub-range of the video).
 
     Returns:
         List of {start_frame, end_frame, duration_frames, label_id, label_name}.
@@ -630,29 +605,31 @@ def group_into_intervals(frame_labels, num_frames, config):
     labels_cfg    = config["labels"]
     label_name_map = {v["id"]: v["name"] for v in labels_cfg.values()}
 
+    sorted_frames  = sorted(frame_labels.keys())
     intervals      = []
     current_label  = None
     current_start  = None
 
-    for fidx in range(num_frames):
-        label = frame_labels.get(fidx, 0)
+    for fidx in sorted_frames:
+        label = frame_labels[fidx]
         if label != current_label:
             if current_label is not None:
                 intervals.append({
                     "start_frame":    current_start,
-                    "end_frame":      fidx - 1,
-                    "duration_frames": fidx - current_start,
+                    "end_frame":      prev_fidx,
+                    "duration_frames": prev_fidx - current_start + 1,
                     "label_id":       current_label,
                     "label_name":     label_name_map.get(current_label, "Unknown"),
                 })
             current_label = label
             current_start = fidx
+        prev_fidx = fidx
 
     if current_label is not None:
         intervals.append({
             "start_frame":    current_start,
-            "end_frame":      num_frames - 1,
-            "duration_frames": num_frames - current_start,
+            "end_frame":      prev_fidx,
+            "duration_frames": prev_fidx - current_start + 1,
             "label_id":       current_label,
             "label_name":     label_name_map.get(current_label, "Unknown"),
         })
@@ -707,6 +684,8 @@ def generate_labeled_frames(
     """
     Save annotated frames with a colored label bar, keyhole box (white),
     and per-track bubble boxes (color-coded by permanence).
+
+    Only frames present in frame_labels are rendered.
     """
     os.makedirs(output_dir, exist_ok=True)
     labels_cfg     = config["labels"]
@@ -720,13 +699,14 @@ def generate_labeled_frames(
             fidx, box = entry[0], entry[1]
             frame_bubble_boxes[fidx].append((box, track))
 
-    for fidx in tqdm(range(len(frame_names)), desc="Saving labeled frames"):
+    frames_to_render = sorted(frame_labels.keys())
+    for fidx in tqdm(frames_to_render, desc="Saving labeled frames"):
         fpath = os.path.join(source_dir, frame_names[fidx])
         img   = cv2.imread(fpath)
         if img is None:
             continue
 
-        label_id   = frame_labels.get(fidx, 0)
+        label_id   = frame_labels[fidx]
         label_name = label_name_map.get(label_id, "Unknown")
         color_rgb  = label_color_map.get(label_id, (128, 128, 128))
         color_bgr  = (color_rgb[2], color_rgb[1], color_rgb[0])
@@ -929,7 +909,8 @@ def main():
     )
 
     if first_keyhole_frame is None:
-        print("  WARNING: No keyhole detected — all frames will be labeled 0.")
+        print("  WARNING: No keyhole detected — skipping labeling.")
+        return
 
     # ── Build bubble tracks ───────────────────────────────────────
     print("\n--- Building bubble tracks ---")
@@ -948,23 +929,32 @@ def main():
     print("\n--- Merging fragmented bubble tracks ---")
     bubble_tracks = merge_fragmented_tracks(bubble_tracks, config)
 
+    # ── Determine analyzed range ────────────────────────────────────
+    kh_frames = sorted(keyhole_positions.keys())
+    analysis_start = kh_frames[0]
+    analysis_end = kh_frames[-1]
+
     # ── Classify bubble tracks ────────────────────────────────────
     print("\n--- Classifying bubble tracks ---")
     classified_tracks = classify_bubble_tracks(
         bubble_tracks, keyhole_positions, config,
+        end_frame=analysis_end,
     )
 
     # ── Label frames ──────────────────────────────────────────────
     print("\n--- Labeling frames ---")
     frame_labels = label_frames(
-        num_frames, keyhole_positions, classified_tracks,
+        classified_tracks,
+        start_frame=analysis_start,
+        end_frame=analysis_end,
     )
 
-    # ── Smooth labels ─────────────────────────────────────────────
-    frame_labels = smooth_labels(frame_labels, config)
+    # NOTE: No label smoothing for generation-based labels.
+    # Birth events are single-frame; majority-vote smoothing erases them.
 
     # ── Group into intervals ──────────────────────────────────────
-    intervals = group_into_intervals(frame_labels, num_frames, config)
+    analyzed_num_frames = analysis_end - analysis_start + 1
+    intervals = group_into_intervals(frame_labels, config)
 
     # ── Print summary ─────────────────────────────────────────────
     labels_cfg     = config["labels"]
@@ -974,15 +964,16 @@ def main():
     print("\n" + "=" * 60)
     print("LABELING SUMMARY")
     print("=" * 60)
-    print(f"First keyhole frame:    {first_keyhole_frame}")
+    print(f"Analysis range:         {analysis_start} - {analysis_end}")
     print(f"Keyhole detection:      GDINO (bubble.pore, shape split)")
     print(f"Total frames:           {num_frames}")
+    print(f"Analyzed frames:        {analyzed_num_frames}")
     print(f"Total intervals:        {len(intervals)}")
     print()
     for label_id in sorted(count_by_label.keys()):
         name  = label_name_map.get(label_id, "Unknown")
         count = count_by_label[label_id]
-        pct   = 100.0 * count / num_frames
+        pct   = 100.0 * count / analyzed_num_frames
         print(f"  [{label_id}] {name}: {count} frames ({pct:.1f}%)")
     print()
     print("Intervals:")
@@ -1007,7 +998,7 @@ def main():
             frame_track_lookup[entry[0]].append(track)
 
     frame_label_details = []
-    for fidx in range(num_frames):
+    for fidx in range(analysis_start, analysis_end + 1):
         label_id   = frame_labels.get(fidx, 0)
         tracks_here = frame_track_lookup.get(fidx, [])
         detail = {
@@ -1032,11 +1023,25 @@ def main():
             detail["keyhole_center"] = [round(kh["cx"], 2), round(kh["cy"], 2)]
         frame_label_details.append(detail)
 
+    # Build compact label sequence and transition counts
+    label_sequence = [frame_labels.get(fidx, 0) for fidx in range(analysis_start, analysis_end + 1)]
+    analyzed_label_sequence = label_sequence
+
+    num_labels = 4
+    transition_counts = [[0] * num_labels for _ in range(num_labels)]
+    for i in range(len(analyzed_label_sequence) - 1):
+        src = analyzed_label_sequence[i]
+        dst = analyzed_label_sequence[i + 1]
+        if 0 <= src < num_labels and 0 <= dst < num_labels:
+            transition_counts[src][dst] += 1
+
     output = {
         "video_path":               video_path,
         "config_file":              args.config,
         "keyhole_detection_method": "gdino_shape_split",
         "first_keyhole_frame":      first_keyhole_frame,
+        "last_keyhole_frame":       analysis_end,
+        "analysis_frame_range":     [analysis_start, analysis_end],
         "image_size":               {"width": img_w, "height": img_h},
         "total_frames":             num_frames,
         "label_definitions": {
@@ -1045,7 +1050,7 @@ def main():
         },
         "summary": {
             label_name_map.get(lid, "Unknown"): count_by_label.get(lid, 0)
-            for lid in range(5)
+            for lid in range(4)
         },
         "intervals":  intervals,
         "tracks": {
@@ -1062,6 +1067,9 @@ def main():
                 for t in classified_tracks
             ],
         },
+        "label_sequence": label_sequence,
+        "analyzed_label_sequence": analyzed_label_sequence,
+        "transition_counts": transition_counts,
         "frame_labels": frame_label_details,
     }
 
