@@ -7,9 +7,13 @@
 # A single "bubble.pore" prompt detects both bubbles and keyholes.
 # They are split by shape: tall/skinny detections → keyhole, others → bubble.
 detection:
+  # Crop top N pixels from each frame before processing.
+  # For 400x1024 frames, crop_top=80 keeps the bottom 320 rows.
+  crop_top: 80
+
   bubble:
     text_prompt: "bubble.pore"
-    box_threshold: 0.30
+    box_threshold: 0.20
     max_box_area_ratio: 0.03
 
   keyhole:
@@ -49,9 +53,10 @@ manual_keyhole:
 # --- Tracking Parameters ---
 tracking:
   track_iou_threshold: 0.2
-  max_track_gap: 5              # frames a track can go undetected before ending
+  max_track_gap: 10             # frames a track can go undetected before ending
   keyhole_min_track_length: 3
   bubble_min_track_length: 1    # keep even single-frame transient bubbles
+  min_consecutive_birth: 2      # a birth requires N consecutive detections (filters isolated noise)
 
 # --- Track Merging ---
 # GDINO sometimes misses a bubble for several frames, splitting one permanent
@@ -61,6 +66,7 @@ track_merging:
   enabled: true
   max_gap_frames: 30            # merge tracks separated by at most this many frames
   max_distance_px: 50           # merge tracks whose endpoints are within this distance
+  max_area_ratio: 2.0           # reject merge if endpoint box area ratio exceeds this
 
 # --- Proximity Classification ---
 # Determines whether a bubble is "near" or "far" from the keyhole.
@@ -69,6 +75,14 @@ proximity:
   method: "center_distance"
   # Distance threshold (pixels) — bubbles within this distance are "near keyhole"
   near_threshold_pixels: 150
+  # Only count a bubble birth as a generation event if the bubble's first
+  # detection is within this distance (px) of the keyhole center.
+  # Bubbles first detected far away are re-detections/noise, not new pores.
+  birth_proximity_px: 150
+  # Heuristic: near-keyhole bubbles lasting >= this many frames are classified
+  # as permanent even if the tracker lost them before end_frame.
+  # Set to 0 to disable (strict: only tracks reaching end_frame are permanent).
+  likely_permanent_min_frames: 25
 
 # --- Label Definitions (4 categories, generation-based) ---
 # Labels are based on bubble GENERATION (birth), not presence.

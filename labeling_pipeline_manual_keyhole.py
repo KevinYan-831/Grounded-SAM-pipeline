@@ -18,8 +18,11 @@ import contextlib
 import json
 import os
 import re
+import shutil
+import tempfile
 from collections import Counter, OrderedDict, defaultdict
 
+import cv2
 import numpy as np
 import yaml
 from PIL import Image as PILImage
@@ -447,6 +450,39 @@ def load_sam_only(sam2_checkpoint, sam2_model_cfg):
     return image_predictor, device
 
 
+def crop_frames_to_dir(src_dir, dst_dir, frame_names, crop_top):
+    """
+    Crop top N pixels from each frame and save to dst_dir.
+    Also copies and adjusts any LabelMe JSON annotations (y -= crop_top).
+    """
+    os.makedirs(dst_dir, exist_ok=True)
+    for fname in tqdm(frame_names, desc=f"Cropping frames (top {crop_top}px)"):
+        src_path = os.path.join(src_dir, fname)
+        dst_path = os.path.join(dst_dir, fname)
+        img = cv2.imread(src_path)
+        if img is None:
+            continue
+        cropped = img[crop_top:, :, :]
+        cv2.imwrite(dst_path, cropped)
+
+    # Copy and adjust LabelMe JSONs
+    for fname in os.listdir(src_dir):
+        if not fname.lower().endswith(".json"):
+            continue
+        src_path = os.path.join(src_dir, fname)
+        dst_path = os.path.join(dst_dir, fname)
+        with open(src_path, "r") as f:
+            data = json.load(f)
+        for shape in data.get("shapes", []):
+            for pt in shape.get("points", []):
+                if len(pt) >= 2:
+                    pt[1] -= crop_top
+        if "imageHeight" in data:
+            data["imageHeight"] -= crop_top
+        with open(dst_path, "w") as f:
+            json.dump(data, f, indent=2)
+
+
 def _load_config(config_path):
     with open(config_path, "r") as f:
         return yaml.safe_load(f)
@@ -530,6 +566,18 @@ def main():
             frames_dir,
             crop_top=CROP_TOP,
         )
+
+    # Optional frame cropping (remove top N pixels before processing)
+    crop_top = config.get("detection", {}).get("crop_top", 0)
+    cropped_frames_dir = None
+    if crop_top > 0 and img_h > crop_top:
+        cropped_frames_dir = os.path.join(
+            os.path.dirname(args.output), "cropped_frames"
+        )
+        crop_frames_to_dir(frames_dir, cropped_frames_dir, frame_names, crop_top)
+        frames_dir = cropped_frames_dir
+        img_h -= crop_top
+        print(f"Cropped frames to {img_w}x{img_h} (removed top {crop_top}px)")
 
     num_frames = len(frame_names)
     print(f"Total frames: {num_frames}, image size: {img_w}x{img_h}")
@@ -634,10 +682,14 @@ def main():
 
     # Labels over analyzed range only (generation-based)
     print("\n--- Labeling frames ---")
+    prox_cfg = config.get("proximity", {})
+    birth_prox = prox_cfg.get("birth_proximity_px")
     frame_labels = label_frames(
         classified_tracks,
         start_frame=start_frame,
         end_frame=end_frame,
+        keyhole_positions=keyhole_positions,
+        birth_proximity_px=birth_prox,
     )
     # NOTE: No label smoothing for generation-based labels.
     # Birth events are single-frame; majority-vote smoothing erases them.
@@ -749,6 +801,7 @@ def main():
                     "avg_distance_to_keyhole": t["avg_distance_to_keyhole"],
                     "first_frame": t["entries"][0][0],
                     "last_frame": t["entries"][-1][0],
+                    "birth_frame": t.get("birth_frame", t["entries"][0][0]),
                 }
                 for t in classified_tracks
             ]

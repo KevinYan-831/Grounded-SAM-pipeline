@@ -324,6 +324,7 @@ def merge_fragmented_tracks(tracks, config):
 
     max_gap  = merge_cfg.get("max_gap_frames", 30)
     max_dist = merge_cfg.get("max_distance_px", 50)
+    max_area_ratio = merge_cfg.get("max_area_ratio", 2.0)
 
     # Sort tracks by their first frame
     sorted_tracks = sorted(tracks, key=lambda t: t["entries"][0][0])
@@ -338,6 +339,10 @@ def merge_fragmented_tracks(tracks, config):
         last_frame = track_i["entries"][-1][0]
         last_box   = track_i["entries"][-1][1]
 
+        # Track the set of frames occupied by the combined track so far,
+        # so we never merge a track that coexists on any frame.
+        occupied_frames = set(e[0] for e in combined_entries)
+
         for j in range(i + 1, len(sorted_tracks)):
             if merged_flags[j]:
                 continue
@@ -349,7 +354,33 @@ def merge_fragmented_tracks(tracks, config):
             if gap > max_gap:
                 break  # tracks are sorted; no later track can be closer
             if gap < 0:
-                continue  # tracks overlap in time — distinct coexisting bubbles
+                continue  # true time overlap — distinct coexisting bubbles
+
+            track_j_entries = list(track_j["entries"])
+            track_j_frames = set(e[0] for e in track_j_entries)
+            overlap = track_j_frames & occupied_frames
+
+            if overlap:
+                # gap == 0: both tracks detected at boundary frame.
+                # If the only overlap is that single boundary frame and the
+                # boxes there are close, treat them as duplicate detections
+                # of the same bubble — dedup and allow merge.
+                if len(overlap) == 1 and overlap == {last_frame}:
+                    lcx = (last_box[0] + last_box[2]) / 2
+                    lcy = (last_box[1] + last_box[3]) / 2
+                    fcx = (first_box_j[0] + first_box_j[2]) / 2
+                    fcy = (first_box_j[1] + first_box_j[3]) / 2
+                    boundary_dist = np.sqrt((lcx - fcx) ** 2 + (lcy - fcy) ** 2)
+                    if boundary_dist > max_dist:
+                        continue  # different bubbles at boundary
+                    # Remove duplicate boundary entry from track_j
+                    track_j_entries = [e for e in track_j_entries if e[0] != last_frame]
+                    if not track_j_entries:
+                        merged_flags[j] = True  # single-frame dup absorbed
+                        continue
+                    track_j_frames = set(e[0] for e in track_j_entries)
+                else:
+                    continue  # multi-frame overlap — distinct bubbles
 
             # Spatial distance between endpoints
             lcx = (last_box[0] + last_box[2]) / 2
@@ -358,12 +389,22 @@ def merge_fragmented_tracks(tracks, config):
             fcy = (first_box_j[1] + first_box_j[3]) / 2
             dist = np.sqrt((lcx - fcx) ** 2 + (lcy - fcy) ** 2)
 
+            # Box size consistency: don't merge if sizes differ too much
+            # (prevents merging a small bubble track with a large new bubble)
+            area_i = (last_box[2] - last_box[0]) * (last_box[3] - last_box[1])
+            area_j = (first_box_j[2] - first_box_j[0]) * (first_box_j[3] - first_box_j[1])
+            if area_i > 0 and area_j > 0:
+                area_ratio = max(area_i, area_j) / min(area_i, area_j)
+                if area_ratio > max_area_ratio:
+                    continue  # box sizes too different — different bubbles
+
             if dist <= max_dist:
-                combined_entries.extend(track_j["entries"])
+                combined_entries.extend(track_j_entries)
                 merged_flags[j] = True
+                occupied_frames.update(track_j_frames)
                 # Update last known position for chained merging
-                last_frame = track_j["entries"][-1][0]
-                last_box   = track_j["entries"][-1][1]
+                last_frame = track_j_entries[-1][0]
+                last_box   = track_j_entries[-1][1]
 
         combined_entries.sort(key=lambda e: e[0])
         result.append({
@@ -468,6 +509,7 @@ def classify_bubble_tracks(bubble_tracks, keyhole_positions, config, end_frame=N
 
     near_threshold = prox_cfg["near_threshold_pixels"]
     method         = prox_cfg.get("method", "center_distance")
+    likely_permanent_min_frames = prox_cfg.get("likely_permanent_min_frames", 0)
 
     # Determine last analyzed frame
     if end_frame is None:
@@ -475,6 +517,8 @@ def classify_bubble_tracks(bubble_tracks, keyhole_positions, config, end_frame=N
             end_frame = max(keyhole_positions.keys())
         else:
             end_frame = 0
+
+    min_consec = config.get("tracking", {}).get("min_consecutive_birth", 2)
 
     classified = []
     for track in bubble_tracks:
@@ -506,7 +550,42 @@ def classify_bubble_tracks(bubble_tracks, keyhole_positions, config, end_frame=N
         avg_distance = float(np.mean(distances)) if distances else float("inf")
         is_near      = avg_distance <= near_threshold
         is_permanent = track_last_frame >= end_frame
-        is_transient = track_last_frame < end_frame
+
+        # Heuristic: near-keyhole bubbles that last long enough are likely
+        # permanent even if the tracker lost them before end_frame.
+        frame_span = track_last_frame - entries[0][0] + 1
+        if not is_permanent and frame_span >= likely_permanent_min_frames:
+            # Check distance at first entry (birth vicinity)
+            first_box = entries[0][1]
+            first_cx = (first_box[0] + first_box[2]) / 2
+            first_cy = (first_box[1] + first_box[3]) / 2
+            first_fidx = entries[0][0]
+            if first_fidx in keyhole_positions:
+                kh = keyhole_positions[first_fidx]
+                birth_dist = np.sqrt(
+                    (first_cx - kh["cx"]) ** 2 + (first_cy - kh["cy"]) ** 2
+                )
+                if birth_dist <= near_threshold:
+                    is_permanent = True
+
+        is_transient = not is_permanent
+
+        # Birth = first frame of the first consecutive run of min_consec frames.
+        # If no such run exists, the track is noise — birth_frame is None and
+        # label_frames will skip it (no generation event).
+        birth = None
+        entry_frames = [e[0] for e in entries]
+        for k in range(len(entry_frames)):
+            run_start = entry_frames[k]
+            run_len = 1
+            for m in range(k + 1, len(entry_frames)):
+                if entry_frames[m] == entry_frames[m - 1] + 1:
+                    run_len += 1
+                else:
+                    break
+            if run_len >= min_consec:
+                birth = run_start
+                break
 
         classified.append({
             **track,
@@ -515,7 +594,7 @@ def classify_bubble_tracks(bubble_tracks, keyhole_positions, config, end_frame=N
             "is_near_keyhole":         is_near,
             "is_permanent":            is_permanent,
             "is_transient":            is_transient,
-            "birth_frame":             entries[0][0],
+            "birth_frame":             birth,
         })
 
     near_count = sum(1 for t in classified if t["is_near_keyhole"])
@@ -534,13 +613,18 @@ def label_frames(
     classified_bubble_tracks,
     start_frame,
     end_frame,
+    keyhole_positions=None,
+    birth_proximity_px=None,
 ):
     """
     Assign a generation-based label to each frame in [start_frame, end_frame].
 
-    Bubbles emerge from the keyhole. When a new bubble is first detected
-    at frame `t`, the frame immediately before it (`t - 1`) is labeled as
-    the generation event.  Only that single frame gets label 2 or 3.
+    Only the first detection of each track counts as a birth event.
+    If keyhole_positions and birth_proximity_px are provided, a birth
+    only counts as a generation event if the bubble's first-detected
+    center is within birth_proximity_px of the keyhole center.  Bubbles
+    that first appear far from the keyhole are assumed to be re-detections
+    or noise, not newly generated pores.
 
     Labels (4 states):
       0 - Normal Process:
@@ -551,17 +635,20 @@ def label_frames(
             generation event.
 
       2 - Permanent Pore Generation:
-            Frame immediately before a newly detected bubble that
-            persists until end_frame.  Permanent wins over transient.
+            Frame immediately before a newly appearing bubble (near keyhole)
+            that persists until end_frame.  Permanent wins over transient.
 
       3 - Transient Pore Generation:
-            Frame immediately before a newly detected bubble that
-            disappears before end_frame.
+            Frame immediately before a newly appearing bubble (near keyhole)
+            that disappears before end_frame.
 
     Args:
-        classified_bubble_tracks: list of classified track dicts (with birth_frame)
+        classified_bubble_tracks: list of classified track dicts
         start_frame: first frame of analyzed range
         end_frame: last frame of analyzed range
+        keyhole_positions: {frame_idx: {"cx", "cy", "bbox"}} or None
+        birth_proximity_px: max distance from keyhole for a birth to count,
+                            or None to skip this filter
 
     Returns:
         dict {frame_idx: label_id} for frames in [start_frame, end_frame]
@@ -571,13 +658,33 @@ def label_frames(
     if not has_any_bubbles:
         return {f: 0 for f in range(start_frame, end_frame + 1)}
 
-    # For each bubble born at frame t, label frame t-1 as generation.
+    # Only the first-ever detection of each track counts as a birth.
+    # Re-appearances after detection gaps (within the same merged track)
+    # are NOT births — the bubble already existed.
     # Permanent (2) wins over transient (3) on the same frame.
     generation_labels = {}
     for track in classified_bubble_tracks:
-        gen_frame = track["birth_frame"] - 1
+        birth = track["birth_frame"]
+        if birth is None:
+            continue
+        gen_frame = birth - 1
         if gen_frame < start_frame:
             continue
+
+        # If birth proximity filter is enabled, skip bubbles whose first
+        # detection is far from the keyhole (not a real generation event).
+        if birth_proximity_px is not None and keyhole_positions:
+            first_entry = track["entries"][0]
+            fidx_birth, box_birth = first_entry[0], first_entry[1]
+            bubble_cx = (box_birth[0] + box_birth[2]) / 2
+            bubble_cy = (box_birth[1] + box_birth[3]) / 2
+            kh = keyhole_positions.get(fidx_birth)
+            if kh is not None:
+                dist = np.sqrt((bubble_cx - kh["cx"]) ** 2 +
+                               (bubble_cy - kh["cy"]) ** 2)
+                if dist > birth_proximity_px:
+                    continue
+
         label = 2 if track["is_permanent"] else 3
         if gen_frame not in generation_labels or label < generation_labels[gen_frame]:
             generation_labels[gen_frame] = label
@@ -943,10 +1050,14 @@ def main():
 
     # ── Label frames ──────────────────────────────────────────────
     print("\n--- Labeling frames ---")
+    prox_cfg = config.get("proximity", {})
+    birth_prox = prox_cfg.get("birth_proximity_px")
     frame_labels = label_frames(
         classified_tracks,
         start_frame=analysis_start,
         end_frame=analysis_end,
+        keyhole_positions=keyhole_positions,
+        birth_proximity_px=birth_prox,
     )
 
     # NOTE: No label smoothing for generation-based labels.

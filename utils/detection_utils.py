@@ -148,7 +148,34 @@ def detect_on_frame(
         boxes.append(bbox)
         names.append(label)
         conf_scores.append(round(float(score.cpu()), 4))
+
+    # NMS: remove duplicate detections of the same object
+    boxes, names, conf_scores = _nms(boxes, names, conf_scores, iou_threshold=0.5)
     return boxes, names, conf_scores
+
+
+def _nms(boxes, names, scores, iou_threshold=0.5):
+    """Non-Maximum Suppression: remove overlapping detections, keep highest score."""
+    if len(boxes) <= 1:
+        return boxes, names, scores
+    # Sort by score descending
+    order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+    keep = []
+    suppressed = set()
+    for idx in order:
+        if idx in suppressed:
+            continue
+        keep.append(idx)
+        for jdx in order:
+            if jdx in suppressed or jdx == idx:
+                continue
+            if box_iou(boxes[idx], boxes[jdx]) > iou_threshold:
+                suppressed.add(jdx)
+    return (
+        [boxes[i] for i in keep],
+        [names[i] for i in keep],
+        [scores[i] for i in keep],
+    )
 
 
 def box_iou(box_a, box_b):
