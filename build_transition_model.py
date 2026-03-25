@@ -154,7 +154,8 @@ def main():
 
     # Header
     short_names = ["Normal", "Unstable", "Permanent", "Transient"]
-    header = f"{'From \\ To':>14s}" + "".join(f"{n:>12s}" for n in short_names)
+    from_to = "From \\ To"
+    header = f"{from_to:>14s}" + "".join(f"{n:>12s}" for n in short_names)
     print(header)
     print("-" * len(header))
 

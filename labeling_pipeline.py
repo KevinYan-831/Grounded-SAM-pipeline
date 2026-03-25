@@ -54,7 +54,7 @@ SOURCE_VIDEO_FRAME_DIR = "./data/frames/custom_video_frames"
 OUTPUT_JSON_PATH = "./data/labeling/labeling_results.json"
 OUTPUT_FRAMES_DIR = "./data/labeling/frames"
 DETECTION_CACHE_PATH = "./data/labeling/raw_detections.json"
-CROP_TOP = 800 - 310  # keep bottom 310 rows
+CROP_TOP = 800 - 320  # keep bottom 310 rows
 FRAME_EXTS = (".jpg", ".jpeg", ".png", ".tif", ".tiff")
 
 GDINO_MODEL_ID = "IDEA-Research/grounding-dino-base"

@@ -150,4 +150,6 @@ outputs/
 data/
 
 .claude
+.gradio
+
 
